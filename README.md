@@ -70,13 +70,39 @@ python3 -m sla_desk ticket resume --db ledger.db --id T-001 --at 2026-03-02T14:0
 - 重复 pause（已暂停）/ 重复 resume（未暂停）报错退出码 2；工单不存在报错退出码 1
 - 成功时退出码 0，stdout 输出与 `ticket show` 相同形状的一行 JSON
 
+## 到期升级
+
+`ticket escalate` 接收 `--db` 与 `--at`（带时区偏移的 ISO8601 时刻），对台账中
+每个已到响应截止、且尚未升级到顶级的工单各执行一次升级：
+
+```bash
+python3 -m sla_desk ticket escalate --db ledger.db --at 2026-03-02T12:00:00+08:00
+```
+
+- 升级等级按优先级固定递进：high→urgent、medium→high、low→medium；urgent 为顶级，
+  不再升级。urgent 的 SLA 响应额度为 30 分钟（high/medium/low 为 60/240/480）
+- 到期判定一律按当前记录重算的有效截止（`ticket show` 的 `deadline`），与状态无关：
+  暂停中工单冻结截止已过也算到期；`--at` 早于工单受理时刻的工单跳过不升级
+- 升级改写优先级并按新等级额度、以升级时刻为锚点重算截止，计时口径与 deadline
+  算法一致，只累计服务时段内的时间：
+  - 运行中工单从 `--at` 起按新额度满额重算
+  - 暂停中工单从 `--at` 起按新额度冻结新截止，仍保持暂停，`paused_at`/`resumed_at`
+    不变；之后 `ticket resume` 的 `--at` 不得早于升级时刻，按剩余额度重算
+- 同一工单可多次升级（如 low→medium 后再次到期→high），每次升级记一条记录
+- 成功时 stdout 输出一行 JSON 数组，元素形状为
+  `{"id":…,"escalations":[…本命令产生的升级记录…]}`，按 id 字典序；无工单到期
+  输出 `[]`、退出码 0
+- 任一工单升级失败时 stdout 为空、退出码 1，全部工单（含已升级的）保持执行前原样，
+  不留半条升级记录
+
 ## 查询
 
 按 id 查询，stdout 输出一行 JSON，包含 `id`、`priority`、`window_id`、`created_at`、
-`deadline`、`state`、`paused_at`、`resumed_at`。`state` 为 `running` 或 `paused`；
-未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。`deadline` 恒为按当前记录
-重算的有效截止：running 且从未暂停时与受理时算法一致，暂停中为按暂停时刻冻结的截止，
-恢复后为补足剩余额度后的新截止。
+`deadline`、`state`、`paused_at`、`resumed_at`、`escalations`。`state` 为 `running`
+或 `paused`；未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。`deadline`
+恒为按当前记录重算的有效截止：running 且从未暂停时与受理时算法一致，暂停中为按暂停
+时刻冻结的截止，恢复后为补足剩余额度后的新截止。`escalations` 为升级记录数组，按
+发生时间升序，每条含 `at`（UTC ISO8601）、`from`、`to`；从未升级为 `[]`。
 
 ```bash
 python3 -m sla_desk ticket show --db ledger.db --id T-001

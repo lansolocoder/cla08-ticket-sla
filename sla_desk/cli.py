@@ -10,7 +10,9 @@ from datetime import datetime, timedelta, timezone
 
 from . import __version__
 
-SLA_MINUTES = {"high": 60, "medium": 240, "low": 480}
+SLA_MINUTES = {"urgent": 30, "high": 60, "medium": 240, "low": 480}
+
+ESCALATION = {"high": "urgent", "medium": "high", "low": "medium"}
 
 _HHMM = re.compile(r"^([0-2]\d):([0-5]\d)$")
 
@@ -122,6 +124,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ticket_resume.set_defaults(handler=_ticket_resume)
 
+    ticket_escalate = ticket_commands.add_parser(
+        "escalate", help="对已到响应截止的工单执行一次升级"
+    )
+    ticket_escalate.add_argument("--db", required=True, help="SQLite 台账路径")
+    ticket_escalate.add_argument(
+        "--at",
+        required=True,
+        type=_parse_timestamp,
+        metavar="ISO8601",
+        help="升级判定/生效时刻（带时区偏移的 ISO8601）",
+    )
+    ticket_escalate.set_defaults(handler=_ticket_escalate)
+
     ticket_show = ticket_commands.add_parser("show", help="按 id 查询工单")
     ticket_show.add_argument("--db", required=True, help="SQLite 台账路径")
     ticket_show.add_argument("--id", required=True, help="工单 id")
@@ -140,6 +155,7 @@ _TICKET_EXTRA_COLUMNS = (
     ("consumed_seconds", "INTEGER NOT NULL DEFAULT 0"),
     ("tz_offset_seconds", "INTEGER NOT NULL DEFAULT 0"),
     ("pause_high_water", "TEXT"),
+    ("escalated_at", "TEXT"),
 )
 
 
@@ -161,7 +177,17 @@ def _connect(db_path: str) -> sqlite3.Connection:
         "resumed_at TEXT, "
         "consumed_seconds INTEGER NOT NULL DEFAULT 0, "
         "tz_offset_seconds INTEGER NOT NULL DEFAULT 0, "
-        "pause_high_water TEXT)"
+        "pause_high_water TEXT, "
+        "escalated_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS escalations ("
+        "ticket_id TEXT NOT NULL REFERENCES tickets(id), "
+        "seq INTEGER NOT NULL, "
+        "at TEXT NOT NULL, "
+        "from_priority TEXT NOT NULL, "
+        "to_priority TEXT NOT NULL, "
+        "PRIMARY KEY (ticket_id, seq))"
     )
     existing = {row[1] for row in conn.execute("PRAGMA table_info(tickets)")}
     for name, declaration in _TICKET_EXTRA_COLUMNS:
@@ -260,12 +286,24 @@ def _parse_utc(text: str) -> datetime:
 _TICKET_SELECT = (
     "SELECT t.id, t.priority, t.window_id, t.created_at, t.paused_at, t.resumed_at, "
     "t.consumed_seconds, t.tz_offset_seconds, t.pause_high_water, "
-    "w.start_minute, w.end_minute "
+    "t.escalated_at, w.start_minute, w.end_minute "
     "FROM tickets t JOIN windows w ON w.id = t.window_id"
 )
 
 
-def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
+def _escalations_for(conn: sqlite3.Connection, ticket_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT at, from_priority, to_priority FROM escalations "
+        "WHERE ticket_id = ? ORDER BY seq ASC",
+        (ticket_id,),
+    ).fetchall()
+    return [
+        {"at": at_text, "from": from_priority, "to": to_priority}
+        for at_text, from_priority, to_priority in rows
+    ]
+
+
+def _ticket_payload(row: sqlite3.Row | tuple, escalations: list[dict]) -> dict:
     (
         _id,
         priority,
@@ -276,6 +314,7 @@ def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
         consumed_seconds,
         tz_offset_seconds,
         _pause_high_water,
+        escalated_at,
         start_minute,
         end_minute,
     ) = row
@@ -285,13 +324,20 @@ def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
     )
     if paused_at is not None:
         state = "paused"
-        anchor = _parse_utc(paused_at).astimezone(tz)
+        # 暂停期间升级时以升级时刻为冻结锚点；升级后再次暂停则以新暂停时刻为准
+        anchor_text = max(
+            text for text in (paused_at, escalated_at) if text is not None
+        )
+        anchor = _parse_utc(anchor_text).astimezone(tz)
     else:
         state = "running"
-        if resumed_at is not None:
-            anchor = _parse_utc(resumed_at).astimezone(tz)
-        else:
-            anchor = _parse_utc(created_at).astimezone(tz)
+        # 运行中升级以升级时刻重新起算；升级后又经历 pause/resume 则以 resumed_at 为准
+        anchor_text = max(
+            text
+            for text in (created_at, resumed_at, escalated_at)
+            if text is not None
+        )
+        anchor = _parse_utc(anchor_text).astimezone(tz)
     deadline = _advance_within_windows(anchor, start_minute, end_minute, remaining)
     return {
         "id": _id,
@@ -302,6 +348,7 @@ def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
         "state": state,
         "paused_at": paused_at,
         "resumed_at": resumed_at,
+        "escalations": escalations,
     }
 
 
@@ -409,13 +456,14 @@ def _ticket_show(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
         return 1
     try:
         row = _fetch_ticket(conn, args.id)
+        if row is None:
+            print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
+            return 1
+        payload = _ticket_payload(row, _escalations_for(conn, args.id))
     finally:
         conn.close()
 
-    if row is None:
-        print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
-        return 1
-    print(json.dumps(_ticket_payload(row), separators=(",", ":")))
+    print(json.dumps(payload, separators=(",", ":")))
     return 0
 
 
@@ -429,10 +477,13 @@ def _ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
         rows = conn.execute(
             _TICKET_SELECT + " ORDER BY t.created_at ASC, t.id ASC"
         ).fetchall()
+        payloads = [
+            _ticket_payload(row, _escalations_for(conn, row[0])) for row in rows
+        ]
     finally:
         conn.close()
 
-    print(json.dumps([_ticket_payload(row) for row in rows], separators=(",", ":")))
+    print(json.dumps(payloads, separators=(",", ":")))
     return 0
 
 
@@ -448,7 +499,7 @@ def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
             return 1
 
-        payload = _ticket_payload(row)
+        payload = _ticket_payload(row, _escalations_for(conn, args.id))
         if payload["state"] == "paused":
             print(
                 f"sla-desk: error: 工单 {args.id!r} 已处于暂停状态",
@@ -480,14 +531,17 @@ def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             consumed_seconds,
             tz_offset_seconds,
             pause_high_water,
+            escalated_at,
             start_minute,
             end_minute,
         ) = row
         tz = timezone(timedelta(seconds=tz_offset_seconds))
-        if resumed_at is not None:
-            anchor = _parse_utc(resumed_at).astimezone(tz)
-        else:
-            anchor = _parse_utc(created_at).astimezone(tz)
+        anchor_text = max(
+            text
+            for text in (created_at, resumed_at, escalated_at)
+            if text is not None
+        )
+        anchor = _parse_utc(anchor_text).astimezone(tz)
         consumed = consumed_seconds + int(
             _window_time_between(
                 anchor, at_utc.astimezone(tz), start_minute, end_minute
@@ -506,10 +560,13 @@ def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         with conn:
             conn.execute(
                 "UPDATE tickets SET paused_at = ?, consumed_seconds = ?, "
-                "pause_high_water = ?, deadline = ? WHERE id = ?",
+                "pause_high_water = ?, deadline = ?, escalated_at = NULL "
+                "WHERE id = ?",
                 (at_text, consumed, pause_high_water, _format_utc(frozen), args.id),
             )
-        payload = _ticket_payload(_fetch_ticket(conn, args.id))
+        payload = _ticket_payload(
+            _fetch_ticket(conn, args.id), _escalations_for(conn, args.id)
+        )
     except sqlite3.Error as exc:
         print(f"sla-desk: error: {exc}", file=sys.stderr)
         return 1
@@ -532,7 +589,7 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
             return 1
 
-        payload = _ticket_payload(row)
+        payload = _ticket_payload(row, _escalations_for(conn, args.id))
         if payload["state"] != "paused":
             print(
                 f"sla-desk: error: 工单 {args.id!r} 未处于暂停状态",
@@ -559,6 +616,7 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             consumed_seconds,
             tz_offset_seconds,
             _high_water,
+            _escalated_at,
             start_minute,
             end_minute,
         ) = row
@@ -573,11 +631,13 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
 
         with conn:
             conn.execute(
-                "UPDATE tickets SET paused_at = NULL, resumed_at = ?, deadline = ? "
-                "WHERE id = ?",
+                "UPDATE tickets SET paused_at = NULL, resumed_at = ?, deadline = ?, "
+                "escalated_at = NULL WHERE id = ?",
                 (at_text, _format_utc(deadline), args.id),
             )
-        payload = _ticket_payload(_fetch_ticket(conn, args.id))
+        payload = _ticket_payload(
+            _fetch_ticket(conn, args.id), _escalations_for(conn, args.id)
+        )
     except sqlite3.Error as exc:
         print(f"sla-desk: error: {exc}", file=sys.stderr)
         return 1
@@ -585,6 +645,127 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         conn.close()
 
     print(json.dumps(payload, separators=(",", ":")))
+    return 0
+
+
+def _ticket_escalate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    try:
+        conn = _connect(args.db)
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: 无法打开台账 {args.db!r}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        rows = conn.execute(_TICKET_SELECT + " ORDER BY t.id ASC").fetchall()
+        at_utc = args.at.astimezone(timezone.utc)
+        at_text = _format_utc(at_utc)
+
+        candidates = []
+        for row in rows:
+            (
+                _id,
+                priority,
+                _window_id,
+                created_at,
+                paused_at,
+                _resumed_at,
+                _consumed_seconds,
+                tz_offset_seconds,
+                pause_high_water,
+                _escalated_at,
+                start_minute,
+                end_minute,
+            ) = row
+            # urgent 为顶级，不再升级
+            if priority not in ESCALATION:
+                continue
+            # --at 早于受理时刻的工单跳过
+            if at_utc < _parse_utc(created_at):
+                continue
+            payload = _ticket_payload(row, _escalations_for(conn, _id))
+            # 到期判定按当前记录重算的有效截止，与状态无关
+            if at_utc < _parse_utc(payload["deadline"]):
+                continue
+            candidates.append(
+                (
+                    _id,
+                    priority,
+                    paused_at,
+                    tz_offset_seconds,
+                    pause_high_water,
+                    start_minute,
+                    end_minute,
+                )
+            )
+
+        results = []
+        with conn:
+            for (
+                ticket_id,
+                old_priority,
+                paused_at,
+                tz_offset_seconds,
+                pause_high_water,
+                start_minute,
+                end_minute,
+            ) in candidates:
+                new_priority = ESCALATION[old_priority]
+                quota = timedelta(minutes=SLA_MINUTES[new_priority])
+                tz = timezone(timedelta(seconds=tz_offset_seconds))
+                new_deadline = _advance_within_windows(
+                    at_utc.astimezone(tz), start_minute, end_minute, quota
+                )
+                new_deadline_text = _format_utc(new_deadline)
+                high_water = pause_high_water
+                if high_water is None or at_text > high_water:
+                    high_water = at_text
+
+                seq_row = conn.execute(
+                    "SELECT COUNT(*) FROM escalations WHERE ticket_id = ?",
+                    (ticket_id,),
+                ).fetchone()
+                conn.execute(
+                    "INSERT INTO escalations "
+                    "(ticket_id, seq, at, from_priority, to_priority) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (ticket_id, seq_row[0] + 1, at_text, old_priority, new_priority),
+                )
+                if paused_at is not None:
+                    # 暂停中：paused_at/resumed_at 不变，以升级时刻冻结新截止
+                    conn.execute(
+                        "UPDATE tickets SET priority = ?, consumed_seconds = 0, "
+                        "deadline = ?, escalated_at = ?, pause_high_water = ? "
+                        "WHERE id = ?",
+                        (
+                            new_priority,
+                            new_deadline_text,
+                            at_text,
+                            high_water,
+                            ticket_id,
+                        ),
+                    )
+                else:
+                    # 运行中：从 --at 起按新额度满额重算
+                    conn.execute(
+                        "UPDATE tickets SET priority = ?, consumed_seconds = 0, "
+                        "deadline = ?, escalated_at = ? WHERE id = ?",
+                        (new_priority, new_deadline_text, at_text, ticket_id),
+                    )
+                results.append(
+                    {
+                        "id": ticket_id,
+                        "escalations": [
+                            {"at": at_text, "from": old_priority, "to": new_priority}
+                        ],
+                    }
+                )
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    results.sort(key=lambda item: item["id"])
+    print(json.dumps(results, separators=(",", ":")))
     return 0
 
 
@@ -598,5 +779,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):
-        parser.error("缺少子命令（window create / ticket create|pause|resume|show|list）")
+        parser.error("缺少子命令（window create / ticket create|pause|resume|escalate|show|list）")
     return args.handler(args, parser)

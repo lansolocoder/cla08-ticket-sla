@@ -319,6 +319,7 @@ class LedgerTests(unittest.TestCase):
                 "state": "running",
                 "paused_at": None,
                 "resumed_at": None,
+                "escalations": [],
             },
         )
         self.assertEqual(result.stderr, "")
@@ -354,7 +355,7 @@ class LedgerTests(unittest.TestCase):
                 set(row),
                 {
                     "id", "priority", "window_id", "created_at", "deadline",
-                    "state", "paused_at", "resumed_at",
+                    "state", "paused_at", "resumed_at", "escalations",
                 },
             )
 
@@ -407,6 +408,7 @@ class LedgerTests(unittest.TestCase):
                 "state": "paused",
                 "paused_at": "2026-03-02T01:45:00Z",
                 "resumed_at": None,
+                "escalations": [],
             },
         )
         self.assertEqual(self.show("t1"), payload)
@@ -440,6 +442,7 @@ class LedgerTests(unittest.TestCase):
                 "state": "running",
                 "paused_at": None,
                 "resumed_at": "2026-03-02T06:00:00Z",
+                "escalations": [],
             },
         )
         self.assertEqual(self.show("t1"), payload)
@@ -572,6 +575,164 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(rows[1]["state"], "running")
         self.assertIsNone(rows[1]["paused_at"])
         self.assertIsNone(rows[1]["resumed_at"])
+
+    # --- escalate ----------------------------------------------------------
+
+    def escalate(self, at: str):
+        return self.invoke("ticket", "escalate", "--db", self.db, "--at", at)
+
+    def test_escalate_running_ticket_recomputes_deadline_from_at(self) -> None:
+        self.create_window()
+        # high = 60 分钟；09:15 受理，截止 10:15
+        self.create_ticket()
+        result = self.escalate("2026-03-02T11:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            [
+                {
+                    "id": "t1",
+                    "escalations": [
+                        {"at": "2026-03-02T03:00:00Z", "from": "high", "to": "urgent"}
+                    ],
+                }
+            ],
+        )
+        payload = self.show("t1")
+        self.assertEqual(payload["priority"], "urgent")
+        # urgent = 30 分钟，从 --at 11:00 起算 → 11:30
+        self.assertEqual(payload["deadline"], "2026-03-02T03:30:00Z")
+        self.assertEqual(
+            payload["escalations"],
+            [{"at": "2026-03-02T03:00:00Z", "from": "high", "to": "urgent"}],
+        )
+
+    def test_escalate_skips_not_due_and_top_level(self) -> None:
+        self.create_window()
+        self.create_ticket("t1", priority="high", created="2026-03-02T09:15:00+08:00")
+        # 未到期
+        result = self.escalate("2026-03-02T10:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]")
+        self.assertEqual(self.show("t1")["priority"], "high")
+        # 升级到 urgent 后不再升级
+        self.assertEqual(self.escalate("2026-03-02T11:00:00+08:00").returncode, 0)
+        result = self.escalate("2026-03-02T12:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]")
+        self.assertEqual(self.show("t1")["priority"], "urgent")
+
+    def test_escalate_skips_at_before_created(self) -> None:
+        self.create_window()
+        self.create_ticket(created="2026-03-05T09:00:00+08:00")
+        result = self.escalate("2026-03-04T10:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]")
+        self.assertEqual(self.show("t1")["escalations"], [])
+
+    def test_escalate_exactly_at_deadline_is_due(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalate("2026-03-02T10:15:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)), 1)
+
+    def test_escalate_paused_ticket_stays_paused_and_freezes_new_deadline(self) -> None:
+        self.create_window()
+        # medium = 240 分钟；09:00 受理，09:30 暂停，冻结截止 13:00
+        self.create_ticket(priority="medium", created="2026-03-02T09:00:00+08:00")
+        self.assertEqual(self.pause("t1", "2026-03-02T09:30:00+08:00").returncode, 0)
+        result = self.escalate("2026-03-03T10:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            [
+                {
+                    "id": "t1",
+                    "escalations": [
+                        {
+                            "at": "2026-03-03T02:00:00Z",
+                            "from": "medium",
+                            "to": "high",
+                        }
+                    ],
+                }
+            ],
+        )
+        payload = self.show("t1")
+        self.assertEqual(payload["state"], "paused")
+        self.assertEqual(payload["paused_at"], "2026-03-02T01:30:00Z")
+        self.assertIsNone(payload["resumed_at"])
+        # high = 60 分钟，从升级时刻 10:00 冻结 → 11:00
+        self.assertEqual(payload["deadline"], "2026-03-03T03:00:00Z")
+
+    def test_resume_after_paused_escalation_uses_escalation_time_as_floor(self) -> None:
+        self.create_window()
+        self.create_ticket(priority="medium", created="2026-03-02T09:00:00+08:00")
+        self.assertEqual(self.pause("t1", "2026-03-02T09:30:00+08:00").returncode, 0)
+        self.assertEqual(self.escalate("2026-03-03T10:00:00+08:00").returncode, 0)
+        # 早于升级时刻的 resume 拒绝且不写库
+        before = self.show("t1")
+        result = self.resume("t1", "2026-03-03T09:00:00+08:00")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("t1"), before)
+        # 晚于升级时刻：按新等级满额（high=60）从恢复时刻重算
+        result = self.resume("t1", "2026-03-03T14:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["deadline"], "2026-03-03T07:00:00Z")
+
+    def test_multiple_escalations_accumulate_in_order(self) -> None:
+        self.create_window()
+        # low 截止 17:00；medium 240 分钟；high 60 分钟
+        self.create_ticket(priority="low", created="2026-03-02T09:00:00+08:00")
+        self.assertEqual(self.escalate("2026-03-02T18:00:00+08:00").returncode, 0)
+        self.assertEqual(self.escalate("2026-03-03T14:00:00+08:00").returncode, 0)
+        payload = self.show("t1")
+        self.assertEqual(payload["priority"], "high")
+        self.assertEqual(
+            payload["escalations"],
+            [
+                {"at": "2026-03-02T10:00:00Z", "from": "low", "to": "medium"},
+                {"at": "2026-03-03T06:00:00Z", "from": "medium", "to": "high"},
+            ],
+        )
+
+    def test_escalate_multiple_tickets_sorted_by_id(self) -> None:
+        self.create_window()
+        self.create_ticket("b", priority="low", created="2026-03-02T09:00:00+08:00")
+        self.create_ticket("a", priority="high", created="2026-03-02T09:00:00+08:00")
+        result = self.escalate("2026-03-02T20:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([row["id"] for row in rows], ["a", "b"])
+        self.assertEqual(rows[0]["escalations"][0]["to"], "urgent")
+        self.assertEqual(rows[1]["escalations"][0]["to"], "medium")
+
+    def test_escalate_failure_rolls_back_everything(self) -> None:
+        self.create_window()
+        self.create_ticket("a", priority="high", created="2026-03-02T09:00:00+08:00")
+        self.create_ticket("b", priority="low", created="2026-03-02T09:00:00+08:00")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "CREATE TRIGGER fail_b BEFORE UPDATE ON tickets "
+                "WHEN NEW.id = 'b' BEGIN SELECT RAISE(ABORT, 'boom'); END"
+            )
+        before_a = self.show("a")
+        before_b = self.show("b")
+        result = self.escalate("2026-03-02T20:00:00+08:00")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("a"), before_a)
+        self.assertEqual(self.show("b"), before_b)
+        with sqlite3.connect(self.db) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM escalations").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_escalate_empty_ledger_outputs_empty_array(self) -> None:
+        result = self.escalate("2026-03-02T20:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]")
 
     # --- global rules ------------------------------------------------------
 
