@@ -15,6 +15,10 @@ PRIORITIES = ("P1", "P2", "P3", "P4")
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 STATE_ACCEPTED = "accepted"
 STATE_PAUSED = "paused"
+STATE_ESCALATED = "escalated"
+
+# 超出 response_due_at 的整秒数超过该阈值时定级 L2，否则 L1
+_L2_OVERDUE_THRESHOLDS = {"P1": 3600, "P2": 7200, "P3": 14400, "P4": 14400}
 
 EXIT_INVALID = 2
 EXIT_DUPLICATE = 3
@@ -44,6 +48,15 @@ def _connect() -> sqlite3.Connection:
             created_at TEXT NOT NULL,
             paused_seconds INTEGER NOT NULL DEFAULT 0,
             paused_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS escalations (
+            ticket_id TEXT NOT NULL,
+            at TEXT NOT NULL,
+            level TEXT NOT NULL
         )
         """
     )
@@ -83,7 +96,7 @@ def _utc_time(value: str) -> datetime:
     return moment
 
 
-def _ticket_json(row: tuple) -> dict:
+def _ticket_json(row: tuple, escalations: list[dict] | None = None) -> dict:
     ticket_id, priority, title, response_minutes, state, created_at, paused_seconds = row
     response_due_at = None
     if created_at is not None and response_minutes is not None:
@@ -99,7 +112,16 @@ def _ticket_json(row: tuple) -> dict:
         "created_at": created_at,
         "response_due_at": response_due_at,
         "paused_seconds": paused_seconds,
+        "escalations": escalations if escalations is not None else [],
     }
+
+
+def _fetch_escalations(connection: sqlite3.Connection, ticket_id: str) -> list[dict]:
+    rows = connection.execute(
+        "SELECT at, level FROM escalations WHERE ticket_id = ? ORDER BY rowid ASC",
+        (ticket_id,),
+    ).fetchall()
+    return [{"at": at, "level": level} for at, level in rows]
 
 
 def _cmd_register(args: argparse.Namespace) -> int:
@@ -135,12 +157,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
         row = connection.execute(
             f"SELECT {_TICKET_COLUMNS} FROM tickets WHERE id = ?", (args.id,)
         ).fetchone()
+        if row is None:
+            print(f"error: 工单不存在: {args.id}", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        escalations = _fetch_escalations(connection, args.id)
     finally:
         connection.close()
-    if row is None:
-        print(f"error: 工单不存在: {args.id}", file=sys.stderr)
-        return EXIT_NOT_FOUND
-    print(json.dumps(_ticket_json(row), ensure_ascii=False))
+    print(json.dumps(_ticket_json(row, escalations), ensure_ascii=False))
     return 0
 
 
@@ -150,10 +173,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
         rows = connection.execute(
             f"SELECT {_TICKET_COLUMNS} FROM tickets ORDER BY created_at ASC, rowid ASC"
         ).fetchall()
+        escalations = [(_fetch_escalations(connection, row[0])) for row in rows]
     finally:
         connection.close()
-    for row in rows:
-        print(json.dumps(_ticket_json(row), ensure_ascii=False))
+    for row, ticket_escalations in zip(rows, escalations):
+        print(json.dumps(_ticket_json(row, ticket_escalations), ensure_ascii=False))
     return 0
 
 
@@ -217,6 +241,71 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _escalation_level(priority: str, overdue_seconds: int) -> str:
+    if overdue_seconds > _L2_OVERDUE_THRESHOLDS[priority]:
+        return "L2"
+    return "L1"
+
+
+def _cmd_escalate(args: argparse.Namespace) -> int:
+    at_text = args.at.strftime(TIME_FORMAT)
+    connection = _connect()
+    try:
+        rows = connection.execute(
+            f"SELECT {_TICKET_COLUMNS} FROM tickets ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        for row in rows:
+            created = datetime.strptime(row[5], TIME_FORMAT).replace(tzinfo=timezone.utc)
+            if args.at < created:
+                print(
+                    f"error: 观察时刻早于工单创建时刻: {row[0]}",
+                    file=sys.stderr,
+                )
+                return EXIT_INVALID
+        due_tickets = []
+        for row in rows:
+            ticket_id, priority, _, response_minutes, state, created_at, paused_seconds = row
+            if state != STATE_ACCEPTED:
+                continue
+            created = datetime.strptime(created_at, TIME_FORMAT).replace(
+                tzinfo=timezone.utc
+            )
+            due = created + timedelta(
+                minutes=response_minutes, seconds=paused_seconds or 0
+            )
+            if args.at < due:
+                continue
+            overdue_seconds = int((args.at - due).total_seconds())
+            due_tickets.append(
+                (ticket_id, priority, _escalation_level(priority, overdue_seconds))
+            )
+        with connection:
+            for ticket_id, _, level in due_tickets:
+                connection.execute(
+                    "UPDATE tickets SET state = ? WHERE id = ?",
+                    (STATE_ESCALATED, ticket_id),
+                )
+                connection.execute(
+                    "INSERT INTO escalations (ticket_id, at, level) VALUES (?, ?, ?)",
+                    (ticket_id, at_text, level),
+                )
+    finally:
+        connection.close()
+    for ticket_id, priority, _ in due_tickets:
+        print(
+            json.dumps(
+                {
+                    "id": ticket_id,
+                    "priority": priority,
+                    "state": STATE_ESCALATED,
+                    "escalated_at": at_text,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sla-desk",
@@ -264,6 +353,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="恢复时刻（UTC，YYYY-MM-DDThh:mm:ssZ）",
     )
     resume.set_defaults(handler=_cmd_resume)
+
+    escalate = subparsers.add_parser("escalate", help="到期升级检查全部工单")
+    escalate.add_argument(
+        "--at",
+        required=True,
+        type=_utc_time,
+        help="观察时刻（UTC，YYYY-MM-DDThh:mm:ssZ）",
+    )
+    escalate.set_defaults(handler=_cmd_escalate)
 
     return parser
 

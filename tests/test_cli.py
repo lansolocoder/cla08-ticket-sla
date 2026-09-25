@@ -93,6 +93,7 @@ class TicketLedgerTests(unittest.TestCase):
                 "created_at",
                 "response_due_at",
                 "paused_seconds",
+                "escalations",
             ],
         )
         self.assertEqual(ticket["id"], "INC-1")
@@ -101,6 +102,7 @@ class TicketLedgerTests(unittest.TestCase):
         self.assertEqual(ticket["response_minutes"], 45)
         self.assertEqual(ticket["state"], "accepted")
         self.assertEqual(ticket["paused_seconds"], 0)
+        self.assertEqual(ticket["escalations"], [])
         self.assertRegex(ticket["created_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertRegex(ticket["response_due_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -278,6 +280,165 @@ class PauseResumeTests(unittest.TestCase):
         listed = [json.loads(line) for line in self.invoke("list").stdout.splitlines()]
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0], self.status())
+
+
+class EscalateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "sla_desk.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, SLA_DESK_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "sla_desk", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    def register(self, ticket_id: str, **overrides: str) -> None:
+        options = {
+            "--priority": "P2",
+            "--title": "示例工单",
+            "--response-minutes": "30",
+        }
+        options.update(overrides)
+        arguments = ["register", "--id", ticket_id]
+        for flag, value in options.items():
+            arguments += [flag, value]
+        result = self.invoke(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def status(self, ticket_id: str) -> dict:
+        result = self.invoke("status", "--id", ticket_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def due_plus(self, ticket_id: str, seconds: int) -> str:
+        from datetime import datetime, timedelta
+
+        due = datetime.strptime(
+            self.status(ticket_id)["response_due_at"], "%Y-%m-%dT%H:%M:%SZ"
+        )
+        return (due + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_overdue_accepted_ticket_is_escalated(self) -> None:
+        self.register("INC-E1", **{"--priority": "P1"})
+        at = self.due_plus("INC-E1", 1)
+        result = self.invoke("escalate", "--at", at)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        escalated = json.loads(lines[0])
+        self.assertEqual(list(escalated), ["id", "priority", "state", "escalated_at"])
+        self.assertEqual(
+            escalated,
+            {"id": "INC-E1", "priority": "P1", "state": "escalated", "escalated_at": at},
+        )
+        ticket = self.status("INC-E1")
+        self.assertEqual(ticket["state"], "escalated")
+        self.assertEqual(ticket["escalations"], [{"at": at, "level": "L1"}])
+
+    def test_no_overdue_tickets_outputs_nothing(self) -> None:
+        self.register("INC-E2", **{"--response-minutes": "1000000"})
+        result = self.invoke("escalate", "--at", "2027-01-01T00:00:00Z")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        ticket = self.status("INC-E2")
+        self.assertEqual(ticket["state"], "accepted")
+        self.assertEqual(ticket["escalations"], [])
+
+    def test_paused_ticket_is_not_escalated(self) -> None:
+        self.register("INC-E3")
+        paused = self.invoke("pause", "--id", "INC-E3", "--at", "2030-01-01T00:00:00Z")
+        self.assertEqual(paused.returncode, 0, paused.stderr)
+        result = self.invoke("escalate", "--at", "2030-06-01T00:00:00Z")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        ticket = self.status("INC-E3")
+        self.assertEqual(ticket["state"], "paused")
+        self.assertEqual(ticket["escalations"], [])
+
+    def test_resumed_ticket_escalates_only_past_shifted_due(self) -> None:
+        self.register("INC-E4")
+        self.invoke("pause", "--id", "INC-E4", "--at", "2030-01-01T00:00:00Z")
+        self.invoke("resume", "--id", "INC-E4", "--at", "2030-01-01T01:00:00Z")
+        shifted_due = self.status("INC-E4")["response_due_at"]
+        from datetime import datetime, timedelta
+
+        due = datetime.strptime(shifted_due, "%Y-%m-%dT%H:%M:%SZ")
+        before = (due - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = self.invoke("escalate", "--at", before)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.status("INC-E4")["state"], "accepted")
+        after = (due + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = self.invoke("escalate", "--at", after)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(self.status("INC-E4")["state"], "escalated")
+
+    def test_level_thresholds_by_priority(self) -> None:
+        cases = [
+            ("P1", 3600, "L1"), ("P1", 3601, "L2"),
+            ("P2", 7200, "L1"), ("P2", 7201, "L2"),
+            ("P3", 14400, "L1"), ("P3", 14401, "L2"),
+            ("P4", 14400, "L1"), ("P4", 14401, "L2"),
+        ]
+        for index, (priority, overdue, level) in enumerate(cases):
+            with self.subTest(priority=priority, overdue=overdue):
+                ticket_id = f"INC-L{index}"
+                self.register(ticket_id, **{"--priority": priority})
+                at = self.due_plus(ticket_id, overdue)
+                result = self.invoke("escalate", "--at", at)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.status(ticket_id)["escalations"], [{"at": at, "level": level}]
+                )
+
+    def test_repeat_escalate_does_not_record_again(self) -> None:
+        self.register("INC-E5")
+        at = self.due_plus("INC-E5", 10)
+        first = self.invoke("escalate", "--at", at)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(first.stdout.splitlines()), 1)
+        later = self.due_plus("INC-E5", 20)
+        second = self.invoke("escalate", "--at", later)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout, "")
+        self.assertEqual(
+            self.status("INC-E5")["escalations"], [{"at": at, "level": "L1"}]
+        )
+
+    def test_observe_before_created_at_is_rejected(self) -> None:
+        self.register("INC-E6")
+        result = self.invoke("escalate", "--at", "2020-01-01T00:00:00Z")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("INC-E6", result.stderr)
+        self.assertEqual(result.stdout, "")
+        ticket = self.status("INC-E6")
+        self.assertEqual(ticket["state"], "accepted")
+        self.assertEqual(ticket["escalations"], [])
+
+    def test_invalid_time_format_exit_2(self) -> None:
+        self.register("INC-E7")
+        for moment in ("2026-09-25 10:00:00", "not-a-time", ""):
+            with self.subTest(moment=moment):
+                result = self.invoke("escalate", "--at", moment)
+                self.assertEqual(result.returncode, 2)
+                self.assertNotEqual(result.stderr, "")
+        self.assertEqual(self.status("INC-E7")["state"], "accepted")
+
+    def test_list_matches_status_shape_after_escalation(self) -> None:
+        self.register("INC-E8")
+        at = self.due_plus("INC-E8", 5)
+        self.invoke("escalate", "--at", at)
+        listed = [json.loads(line) for line in self.invoke("list").stdout.splitlines()]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0], self.status("INC-E8"))
 
 
 if __name__ == "__main__":
