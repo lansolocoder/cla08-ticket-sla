@@ -131,6 +131,26 @@ def build_parser() -> argparse.ArgumentParser:
     ticket_list.add_argument("--db", required=True, help="SQLite 台账路径")
     ticket_list.set_defaults(handler=_ticket_list)
 
+    ticket_escalate = ticket_commands.add_parser("escalate", help="登记工单升级路由")
+    ticket_escalate.add_argument("--db", required=True, help="SQLite 台账路径")
+    ticket_escalate.add_argument("--id", required=True, help="工单 id")
+    ticket_escalate.add_argument(
+        "--at",
+        required=True,
+        type=_parse_timestamp,
+        metavar="ISO8601",
+        help="升级时刻（带时区偏移的 ISO8601）",
+    )
+    ticket_escalate.add_argument("--to", required=True, help="目标队列名")
+    ticket_escalate.set_defaults(handler=_ticket_escalate)
+
+    ticket_escalations = ticket_commands.add_parser(
+        "escalations", help="查询工单升级记录"
+    )
+    ticket_escalations.add_argument("--db", required=True, help="SQLite 台账路径")
+    ticket_escalations.add_argument("--id", required=True, help="工单 id")
+    ticket_escalations.set_defaults(handler=_ticket_escalations)
+
     return parser
 
 
@@ -167,6 +187,14 @@ def _connect(db_path: str) -> sqlite3.Connection:
     for name, declaration in _TICKET_EXTRA_COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE tickets ADD COLUMN {name} {declaration}")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS escalations ("
+        "seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "ticket_id TEXT NOT NULL REFERENCES tickets(id), "
+        "to_queue TEXT NOT NULL, "
+        "at TEXT NOT NULL, "
+        "reason TEXT NOT NULL)"
+    )
     conn.commit()
     return conn
 
@@ -436,6 +464,108 @@ def _ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
     return 0
 
 
+_ESCALATION_SELECT = (
+    "SELECT ticket_id, to_queue, at, reason FROM escalations"
+)
+
+
+def _escalation_payload(row: sqlite3.Row | tuple) -> dict:
+    ticket_id, to_queue, at, reason = row
+    return {"id": ticket_id, "to": to_queue, "at": at, "reason": reason}
+
+
+def _ticket_escalate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.to == "":
+        parser.error("--to 必须是非空的目标队列名")
+
+    try:
+        conn = _connect(args.db)
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: 无法打开台账 {args.db!r}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        row = _fetch_ticket(conn, args.id)
+        if row is None:
+            print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
+            return 1
+
+        payload = _ticket_payload(row)
+        at_utc = args.at.astimezone(timezone.utc)
+        at_text = _format_utc(at_utc)
+        if at_utc < _parse_utc(payload["created_at"]):
+            print(
+                f"sla-desk: error: --at 早于工单 {args.id!r} 的受理时刻",
+                file=sys.stderr,
+            )
+            return 2
+
+        reason = (
+            "deadline-exceeded"
+            if at_utc >= _parse_utc(payload["deadline"])
+            else "manual"
+        )
+
+        try:
+            with conn:
+                latest = conn.execute(
+                    "SELECT at FROM escalations WHERE ticket_id = ? "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (args.id,),
+                ).fetchone()
+                if latest is not None and latest[0] == at_text:
+                    print(
+                        f"sla-desk: error: 工单 {args.id!r} 最近一条升级记录的时刻"
+                        f"与 --at {at_text} 相同",
+                        file=sys.stderr,
+                    )
+                    return 2
+                conn.execute(
+                    "INSERT INTO escalations (ticket_id, to_queue, at, reason) "
+                    "VALUES (?, ?, ?, ?)",
+                    (args.id, args.to, at_text, reason),
+                )
+        except sqlite3.Error as exc:
+            print(f"sla-desk: error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    print(
+        json.dumps(
+            {"id": args.id, "to": args.to, "at": at_text, "reason": reason},
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def _ticket_escalations(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    try:
+        conn = _connect(args.db)
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: 无法打开台账 {args.db!r}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        row = _fetch_ticket(conn, args.id)
+        if row is None:
+            print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
+            return 1
+        rows = conn.execute(
+            _ESCALATION_SELECT
+            + " WHERE ticket_id = ? ORDER BY at ASC, seq ASC",
+            (args.id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    print(
+        json.dumps(
+            [_escalation_payload(row) for row in rows], separators=(",", ":")
+        )
+    )
+    return 0
+
+
 def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     try:
         conn = _connect(args.db)
@@ -598,5 +728,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):
-        parser.error("缺少子命令（window create / ticket create|pause|resume|show|list）")
+        parser.error(
+            "缺少子命令（window create / ticket create|pause|resume|show|list"
+            "|escalate|escalations）"
+        )
     return args.handler(args, parser)

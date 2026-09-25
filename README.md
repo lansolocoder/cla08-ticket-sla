@@ -70,6 +70,38 @@ python3 -m sla_desk ticket resume --db ledger.db --id T-001 --at 2026-03-02T14:0
 - 重复 pause（已暂停）/ 重复 resume（未暂停）报错退出码 2；工单不存在报错退出码 1
 - 成功时退出码 0，stdout 输出与 `ticket show` 相同形状的一行 JSON
 
+## 升级路由
+
+`ticket escalate` 接收 `--db`、`--id`、`--at`（带时区偏移的 ISO8601 时刻）与
+`--to`（非空目标队列名），登记一条不可变升级记录。升级不影响 SLA 计时：
+`state`、`paused_at`、`resumed_at`、`deadline`、`consumed_seconds` 均不改变，
+工单处于暂停状态时也可升级。
+
+```bash
+python3 -m sla_desk ticket escalate --db ledger.db --id T-001 \
+    --to l2-oncall --at 2026-03-02T10:20:00+08:00
+```
+
+每条记录含 `id`（工单 id）、`to`（目标队列）、`at`（UTC ISO8601）、`reason`：
+
+- `--at` 不早于工单当前有效 `deadline` 时 `reason` 为 `deadline-exceeded`，否则为 `manual`
+- `--at` 早于 `created_at` 时拒绝（退出码 2）不写库
+- 同一工单可多次升级，同一 `--to` 重复升级照常新增记录（不覆盖不合并）
+- 但 `--at` 与该工单最近一条升级记录时刻完全相同时拒绝（退出码 2）且不写新记录；
+  因此连续两次内容完全相同（`--at`、`--to` 均相同）的升级只有第一次生效
+- 工单不存在报错退出码 1；成功时退出码 0，stdout 输出该条记录的一行 JSON
+
+查询工单的全部升级记录，按 `at` 升序（同时刻按写入先后），从未升级输出 `[]`；
+工单不存在报错退出码 1：
+
+```bash
+python3 -m sla_desk ticket escalations --db ledger.db --id T-001
+```
+
+```json
+[{"id":"T-001","to":"l2-oncall","at":"2026-03-02T02:20:00Z","reason":"deadline-exceeded"}]
+```
+
 ## 查询
 
 按 id 查询，stdout 输出一行 JSON，包含 `id`、`priority`、`window_id`、`created_at`、

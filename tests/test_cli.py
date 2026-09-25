@@ -573,6 +573,213 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNone(rows[1]["paused_at"])
         self.assertIsNone(rows[1]["resumed_at"])
 
+    # --- escalate / escalations -------------------------------------------
+
+    def escalate(self, tid: str, to: str, at: str):
+        return self.invoke(
+            "ticket", "escalate", "--db", self.db,
+            "--id", tid, "--to", to, "--at", at,
+        )
+
+    def escalations(self, tid: str):
+        return self.invoke("ticket", "escalations", "--db", self.db, "--id", tid)
+
+    def escalation_count(self, tid: str = "t1") -> int:
+        with sqlite3.connect(self.db) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM escalations WHERE ticket_id = ?", (tid,)
+            ).fetchone()[0]
+
+    def test_manual_escalation_before_deadline(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        # deadline 为 10:15+08；09:45 在截止前 → manual
+        result = self.escalate("t1", "l2", "2026-03-02T09:45:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "id": "t1",
+                "to": "l2",
+                "at": "2026-03-02T01:45:00Z",
+                "reason": "manual",
+            },
+        )
+
+    def test_escalation_exactly_at_deadline_is_deadline_exceeded(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalate("t1", "l2", "2026-03-02T10:15:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reason"], "deadline-exceeded")
+
+    def test_escalation_after_deadline_is_deadline_exceeded(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalate("t1", "l2", "2026-03-03T10:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reason"], "deadline-exceeded")
+        self.assertEqual(
+            json.loads(result.stdout)["at"], "2026-03-03T02:00:00Z"
+        )
+
+    def test_escalations_empty_outputs_empty_array(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalations("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]")
+
+    def test_escalations_ordered_by_at_then_write_order(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        # 09:45、10:00（manual），10:15（deadline-exceeded），乱序写入同一时刻两条
+        self.assertEqual(
+            self.escalate("t1", "c", "2026-03-02T10:15:00+08:00").returncode, 0
+        )
+        self.assertEqual(
+            self.escalate("t1", "a", "2026-03-02T09:45:00+08:00").returncode, 0
+        )
+        self.assertEqual(
+            self.escalate("t1", "b", "2026-03-02T10:00:00+08:00").returncode, 0
+        )
+        self.assertEqual(
+            self.escalate("t1", "a2", "2026-03-02T09:45:00+08:00").returncode, 0
+        )
+        result = self.escalations("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual(
+            [(r["at"], r["to"]) for r in rows],
+            [
+                ("2026-03-02T01:45:00Z", "a"),
+                ("2026-03-02T01:45:00Z", "a2"),
+                ("2026-03-02T02:00:00Z", "b"),
+                ("2026-03-02T02:15:00Z", "c"),
+            ],
+        )
+        for row in rows:
+            self.assertEqual(set(row), {"id", "to", "at", "reason"})
+            self.assertEqual(row["id"], "t1")
+
+    def test_repeated_same_to_new_at_adds_record(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(
+            self.escalate("t1", "l2", "2026-03-02T09:45:00+08:00").returncode, 0
+        )
+        result = self.escalate("t1", "l2", "2026-03-02T10:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.escalation_count(), 2)
+
+    def test_identical_consecutive_request_is_rc2_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        first = self.escalate("t1", "l2", "2026-03-02T09:45:00+08:00")
+        self.assertEqual(first.returncode, 0)
+        result = self.escalate("t1", "l2", "2026-03-02T09:45:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("t1", result.stderr)
+        self.assertEqual(self.escalation_count(), 1)
+
+    def test_same_at_as_latest_different_to_also_rc2(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(
+            self.escalate("t1", "l2", "2026-03-02T09:45:00+08:00").returncode, 0
+        )
+        result = self.escalate("t1", "l3", "2026-03-02T09:45:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.escalation_count(), 1)
+
+    def test_same_at_as_non_latest_record_is_allowed(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(
+            self.escalate("t1", "l2", "2026-03-02T09:45:00+08:00").returncode, 0
+        )
+        self.assertEqual(
+            self.escalate("t1", "l2", "2026-03-02T10:00:00+08:00").returncode, 0
+        )
+        # 与最早一条同时刻，但最近一条是 10:00 → 允许
+        result = self.escalate("t1", "l3", "2026-03-02T09:45:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.escalation_count(), 3)
+
+    def test_escalation_before_created_rejected_rc2(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        before = self.show("t1")
+        result = self.escalate("t1", "l2", "2026-03-02T09:00:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.escalation_count(), 0)
+        self.assertEqual(self.show("t1"), before)
+
+    def test_escalation_exactly_at_created_allowed(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalate("t1", "l2", "2026-03-02T09:15:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["at"], "2026-03-02T01:15:00Z")
+
+    def test_escalate_missing_ticket_is_rc1(self) -> None:
+        self.create_window()
+        result = self.escalate("ghost", "l2", "2026-03-02T10:00:00+08:00")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("ghost", result.stderr)
+
+    def test_escalations_missing_ticket_is_rc1(self) -> None:
+        self.create_window()
+        result = self.escalations("ghost")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("ghost", result.stderr)
+
+    def test_escalate_naive_or_malformed_at_rejected_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        for bad in ["2026-03-02T10:00:00", "garbage"]:
+            with self.subTest(bad=bad):
+                result = self.escalate("t1", "l2", bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.escalation_count(), 0)
+
+    def test_empty_to_rejected(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalate("t1", "", "2026-03-02T10:00:00+08:00")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.escalation_count(), 0)
+
+    def test_escalation_does_not_change_sla_state(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(self.pause("t1", "2026-03-02T09:45:00+08:00").returncode, 0)
+        before = self.show("t1")
+        # 暂停中且在截止后升级，SLA 字段保持不变
+        result = self.escalate("t1", "l2", "2026-03-02T11:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reason"], "deadline-exceeded")
+        self.assertEqual(self.show("t1"), before)
+        self.assertEqual(before["state"], "paused")
+
+    def test_failed_escalation_leaves_escalations_unchanged(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(
+            self.escalate("t1", "l2", "2026-03-02T09:45:00+08:00").returncode, 0
+        )
+        before = self.escalations("t1").stdout
+        result = self.escalate("t1", "l3", "2026-03-02T09:45:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.escalations("t1").stdout, before)
+
     # --- global rules ------------------------------------------------------
 
     def test_db_is_required(self) -> None:
@@ -581,6 +788,9 @@ class LedgerTests(unittest.TestCase):
             ("ticket", "show", "--id", "t1"),
             ("ticket", "create", "--id", "t1", "--priority", "high",
              "--window-id", "w1", "--created-at", "2026-03-02T09:15:00+08:00"),
+            ("ticket", "escalate", "--id", "t1", "--to", "l2",
+             "--at", "2026-03-02T09:15:00+08:00"),
+            ("ticket", "escalations", "--id", "t1"),
             ("window", "create", "--id", "w1", "--start", "09:00", "--end", "18:00"),
         ]:
             with self.subTest(invocation=invocation):
