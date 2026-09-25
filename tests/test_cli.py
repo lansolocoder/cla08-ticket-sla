@@ -168,5 +168,117 @@ class TicketLedgerTests(unittest.TestCase):
         self.assertEqual(listed, [" INC-6 ", "inc-6", "INC-6"])
 
 
+class PauseResumeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "sla_desk.db"
+        result = self.invoke(
+            "register", "--id", "INC-7", "--priority", "P1",
+            "--title", "等待客户补件", "--response-minutes", "30",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, SLA_DESK_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "sla_desk", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    def status(self) -> dict:
+        result = self.invoke("status", "--id", "INC-7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_pause_then_resume_shifts_response_due_at(self) -> None:
+        before = self.status()
+        self.assertEqual(before["state"], "accepted")
+
+        result = self.invoke("pause", "--id", "INC-7", "--at", "2026-09-25T10:00:00Z")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "paused INC-7 paused")
+        paused = self.status()
+        self.assertEqual(paused["state"], "paused")
+        self.assertEqual(paused["paused_seconds"], 0)
+        self.assertEqual(paused["response_due_at"], before["response_due_at"])
+
+        result = self.invoke("resume", "--id", "INC-7", "--at", "2026-09-25T10:05:30Z")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "resumed INC-7 accepted")
+        resumed = self.status()
+        self.assertEqual(resumed["state"], "accepted")
+        self.assertEqual(resumed["paused_seconds"], 330)
+
+        from datetime import datetime, timedelta
+
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        shift = datetime.strptime(resumed["response_due_at"], fmt) - datetime.strptime(
+            before["response_due_at"], fmt
+        )
+        self.assertEqual(shift, timedelta(seconds=330))
+
+    def test_pause_intervals_accumulate(self) -> None:
+        self.invoke("pause", "--id", "INC-7", "--at", "2026-09-25T10:00:00Z")
+        self.invoke("resume", "--id", "INC-7", "--at", "2026-09-25T10:01:00Z")
+        self.invoke("pause", "--id", "INC-7", "--at", "2026-09-25T11:00:00Z")
+        self.invoke("resume", "--id", "INC-7", "--at", "2026-09-25T11:02:30Z")
+        ticket = self.status()
+        self.assertEqual(ticket["paused_seconds"], 60 + 150)
+
+    def test_double_pause_is_conflict_and_keeps_state(self) -> None:
+        self.invoke("pause", "--id", "INC-7", "--at", "2026-09-25T10:00:00Z")
+        result = self.invoke("pause", "--id", "INC-7", "--at", "2026-09-25T11:00:00Z")
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("INC-7", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.status()["state"], "paused")
+        result = self.invoke("resume", "--id", "INC-7", "--at", "2026-09-25T10:00:30Z")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.status()["paused_seconds"], 30)
+
+    def test_resume_without_pause_is_conflict(self) -> None:
+        result = self.invoke("resume", "--id", "INC-7", "--at", "2026-09-25T10:00:00Z")
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("INC-7", result.stderr)
+        self.assertEqual(self.status()["state"], "accepted")
+        self.assertEqual(self.status()["paused_seconds"], 0)
+
+    def test_pause_and_resume_unknown_id_is_not_found(self) -> None:
+        for command in ("pause", "resume"):
+            with self.subTest(command=command):
+                result = self.invoke(command, "--id", "NOPE-1", "--at", "2026-09-25T10:00:00Z")
+                self.assertEqual(result.returncode, 4)
+                self.assertIn("NOPE-1", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_resume_before_pause_is_rejected(self) -> None:
+        self.invoke("pause", "--id", "INC-7", "--at", "2026-09-25T10:00:00Z")
+        result = self.invoke("resume", "--id", "INC-7", "--at", "2026-09-25T09:59:59Z")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("INC-7", result.stderr)
+        ticket = self.status()
+        self.assertEqual(ticket["state"], "paused")
+        self.assertEqual(ticket["paused_seconds"], 0)
+
+    def test_invalid_time_format_exit_2(self) -> None:
+        for moment in ("2026-09-25 10:00:00", "2026-09-25T10:00:00", "not-a-time", ""):
+            with self.subTest(moment=moment):
+                result = self.invoke("pause", "--id", "INC-7", "--at", moment)
+                self.assertEqual(result.returncode, 2)
+                self.assertNotEqual(result.stderr, "")
+        self.assertEqual(self.status()["state"], "accepted")
+
+    def test_list_matches_status_shape_after_pause(self) -> None:
+        self.invoke("pause", "--id", "INC-7", "--at", "2026-09-25T10:00:00Z")
+        listed = [json.loads(line) for line in self.invoke("list").stdout.splitlines()]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0], self.status())
+
+
 if __name__ == "__main__":
     unittest.main()
