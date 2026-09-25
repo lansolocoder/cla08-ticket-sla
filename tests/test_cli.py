@@ -316,6 +316,9 @@ class LedgerTests(unittest.TestCase):
                 "window_id": "w1",
                 "created_at": "2026-03-02T01:15:00Z",
                 "deadline": "2026-03-02T02:15:00Z",
+                "state": "running",
+                "paused_at": None,
+                "resumed_at": None,
             },
         )
         self.assertEqual(result.stderr, "")
@@ -348,13 +351,227 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in rows], ["c", "a", "b"])
         for row in rows:
             self.assertEqual(
-                set(row), {"id", "priority", "window_id", "created_at", "deadline"}
+                set(row),
+                {
+                    "id", "priority", "window_id", "created_at", "deadline",
+                    "state", "paused_at", "resumed_at",
+                },
             )
 
     def test_list_empty_ledger_outputs_empty_array(self) -> None:
         result = self.invoke("ticket", "list", "--db", self.db)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "[]")
+
+    # --- pause / resume ----------------------------------------------------
+
+    def create_ticket(
+        self,
+        tid: str = "t1",
+        priority: str = "high",
+        created: str = "2026-03-02T09:15:00+08:00",
+    ):
+        return self.invoke(
+            "ticket", "create", "--db", self.db,
+            "--id", tid, "--priority", priority, "--window-id", "w1",
+            "--created-at", created,
+        )
+
+    def pause(self, tid: str, at: str):
+        return self.invoke("ticket", "pause", "--db", self.db, "--id", tid, "--at", at)
+
+    def resume(self, tid: str, at: str):
+        return self.invoke(
+            "ticket", "resume", "--db", self.db, "--id", tid, "--at", at
+        )
+
+    def show(self, tid: str) -> dict:
+        result = self.invoke("ticket", "show", "--db", self.db, "--id", tid)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_pause_freezes_deadline_and_sets_state(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.pause("t1", "2026-03-02T09:45:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload,
+            {
+                "id": "t1",
+                "priority": "high",
+                "window_id": "w1",
+                "created_at": "2026-03-02T01:15:00Z",
+                "deadline": "2026-03-02T02:15:00Z",
+                "state": "paused",
+                "paused_at": "2026-03-02T01:45:00Z",
+                "resumed_at": None,
+            },
+        )
+        self.assertEqual(self.show("t1"), payload)
+
+    def test_pause_outside_window_counts_only_window_time(self) -> None:
+        self.create_window()
+        # medium = 240 分钟；16:00 受理，当天计 120 分钟，次日再计 120 分钟到 11:00
+        self.create_ticket(priority="medium", created="2026-03-02T16:00:00+08:00")
+        result = self.pause("t1", "2026-03-02T20:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["state"], "paused")
+        self.assertEqual(payload["paused_at"], "2026-03-02T12:00:00Z")
+        self.assertEqual(payload["deadline"], "2026-03-03T03:00:00Z")
+
+    def test_resume_recomputes_deadline_from_remaining_quota(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(self.pause("t1", "2026-03-02T09:45:00+08:00").returncode, 0)
+        result = self.resume("t1", "2026-03-02T14:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload,
+            {
+                "id": "t1",
+                "priority": "high",
+                "window_id": "w1",
+                "created_at": "2026-03-02T01:15:00Z",
+                "deadline": "2026-03-02T06:30:00Z",
+                "state": "running",
+                "paused_at": None,
+                "resumed_at": "2026-03-02T06:00:00Z",
+            },
+        )
+        self.assertEqual(self.show("t1"), payload)
+
+    def test_resume_spills_remaining_quota_into_next_days(self) -> None:
+        self.create_window()
+        # medium = 240 分钟；17:00 受理，原截止次日 12:00
+        self.create_ticket(priority="medium", created="2026-03-02T17:00:00+08:00")
+        # 暂停于 17:30，已耗 30 分钟，剩余 210 分钟
+        self.assertEqual(self.pause("t1", "2026-03-02T17:30:00+08:00").returncode, 0)
+        # 次日 16:00 恢复：当天计 120 分钟，余 90 分钟到再次日 10:30
+        result = self.resume("t1", "2026-03-03T16:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["deadline"], "2026-03-04T02:30:00Z")
+
+    def test_multiple_pause_resume_cycles_accumulate_consumed(self) -> None:
+        self.create_window()
+        # high = 60 分钟；09:00 受理，原截止 10:00
+        self.create_ticket(created="2026-03-02T09:00:00+08:00")
+        self.assertEqual(self.pause("t1", "2026-03-02T09:20:00+08:00").returncode, 0)
+        result = self.resume("t1", "2026-03-02T10:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["deadline"], "2026-03-02T02:40:00Z")
+        # 再暂停于 10:30：累计已耗 20 + 30 = 50 分钟，剩余 10 分钟
+        result = self.pause("t1", "2026-03-02T10:30:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["state"], "paused")
+        self.assertEqual(payload["resumed_at"], "2026-03-02T02:00:00Z")
+        self.assertEqual(payload["deadline"], "2026-03-02T02:40:00Z")
+        # 12:00 恢复，截止 12:10
+        result = self.resume("t1", "2026-03-02T12:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["deadline"], "2026-03-02T04:10:00Z")
+
+    def test_repeated_pause_is_rc2_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(self.pause("t1", "2026-03-02T09:45:00+08:00").returncode, 0)
+        before = self.show("t1")
+        result = self.pause("t1", "2026-03-02T09:50:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("t1", result.stderr)
+        self.assertEqual(self.show("t1"), before)
+
+    def test_resume_without_pause_is_rc2_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        before = self.show("t1")
+        result = self.resume("t1", "2026-03-02T10:00:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("t1", result.stderr)
+        self.assertEqual(self.show("t1"), before)
+
+    def test_pause_and_resume_missing_ticket_is_rc1(self) -> None:
+        self.create_window()
+        for action in ("pause", "resume"):
+            with self.subTest(action=action):
+                result = self.invoke(
+                    "ticket", action, "--db", self.db,
+                    "--id", "ghost", "--at", "2026-03-02T10:00:00+08:00",
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("ghost", result.stderr)
+
+    def test_pause_before_created_rejected_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        before = self.show("t1")
+        result = self.pause("t1", "2026-03-02T09:00:00+08:00")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("t1"), before)
+
+    def test_pause_after_deadline_rejected_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        before = self.show("t1")
+        result = self.pause("t1", "2026-03-02T10:16:00+08:00")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("t1"), before)
+
+    def test_pause_exactly_at_deadline_allowed(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.pause("t1", "2026-03-02T10:15:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["state"], "paused")
+        self.assertEqual(payload["deadline"], "2026-03-02T02:15:00Z")
+
+    def test_resume_before_pause_rejected_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(self.pause("t1", "2026-03-02T09:45:00+08:00").returncode, 0)
+        before = self.show("t1")
+        result = self.resume("t1", "2026-03-02T09:30:00+08:00")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("t1"), before)
+
+    def test_pause_resume_naive_timestamp_rejected(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        for action in ("pause", "resume"):
+            with self.subTest(action=action):
+                result = self.invoke(
+                    "ticket", action, "--db", self.db,
+                    "--id", "t1", "--at", "2026-03-02T10:00:00",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("timezone", result.stderr)
+
+    def test_list_reflects_pause_resume_state(self) -> None:
+        self.create_window()
+        self.create_ticket("a", created="2026-03-02T09:00:00+08:00")
+        self.create_ticket("b", created="2026-03-02T09:30:00+08:00")
+        self.assertEqual(self.pause("a", "2026-03-02T09:20:00+08:00").returncode, 0)
+        result = self.invoke("ticket", "list", "--db", self.db)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([row["id"] for row in rows], ["a", "b"])
+        self.assertEqual(rows[0]["state"], "paused")
+        self.assertEqual(rows[0]["paused_at"], "2026-03-02T01:20:00Z")
+        self.assertEqual(rows[1]["state"], "running")
+        self.assertIsNone(rows[1]["paused_at"])
+        self.assertIsNone(rows[1]["resumed_at"])
 
     # --- global rules ------------------------------------------------------
 

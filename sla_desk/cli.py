@@ -29,7 +29,7 @@ def _parse_hhmm(value: str) -> int:
     return hour * 60 + minute
 
 
-def _parse_created_at(value: str) -> datetime:
+def _parse_timestamp(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
@@ -92,11 +92,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--created-at",
         required=True,
         dest="created_at",
-        type=_parse_created_at,
+        type=_parse_timestamp,
         metavar="ISO8601",
         help="受理时刻（带时区偏移的 ISO8601）",
     )
     ticket_create.set_defaults(handler=_ticket_create)
+
+    ticket_pause = ticket_commands.add_parser("pause", help="暂停工单 SLA 计时")
+    ticket_pause.add_argument("--db", required=True, help="SQLite 台账路径")
+    ticket_pause.add_argument("--id", required=True, help="工单 id")
+    ticket_pause.add_argument(
+        "--at",
+        required=True,
+        type=_parse_timestamp,
+        metavar="ISO8601",
+        help="暂停时刻（带时区偏移的 ISO8601）",
+    )
+    ticket_pause.set_defaults(handler=_ticket_pause)
+
+    ticket_resume = ticket_commands.add_parser("resume", help="恢复工单 SLA 计时")
+    ticket_resume.add_argument("--db", required=True, help="SQLite 台账路径")
+    ticket_resume.add_argument("--id", required=True, help="工单 id")
+    ticket_resume.add_argument(
+        "--at",
+        required=True,
+        type=_parse_timestamp,
+        metavar="ISO8601",
+        help="恢复时刻（带时区偏移的 ISO8601）",
+    )
+    ticket_resume.set_defaults(handler=_ticket_resume)
 
     ticket_show = ticket_commands.add_parser("show", help="按 id 查询工单")
     ticket_show.add_argument("--db", required=True, help="SQLite 台账路径")
@@ -108,6 +132,15 @@ def build_parser() -> argparse.ArgumentParser:
     ticket_list.set_defaults(handler=_ticket_list)
 
     return parser
+
+
+_TICKET_EXTRA_COLUMNS = (
+    ("paused_at", "TEXT"),
+    ("resumed_at", "TEXT"),
+    ("consumed_seconds", "INTEGER NOT NULL DEFAULT 0"),
+    ("tz_offset_seconds", "INTEGER NOT NULL DEFAULT 0"),
+    ("pause_high_water", "TEXT"),
+)
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -123,63 +156,152 @@ def _connect(db_path: str) -> sqlite3.Connection:
         "priority TEXT NOT NULL, "
         "window_id TEXT NOT NULL REFERENCES windows(id), "
         "created_at TEXT NOT NULL, "
-        "deadline TEXT NOT NULL)"
+        "deadline TEXT NOT NULL, "
+        "paused_at TEXT, "
+        "resumed_at TEXT, "
+        "consumed_seconds INTEGER NOT NULL DEFAULT 0, "
+        "tz_offset_seconds INTEGER NOT NULL DEFAULT 0, "
+        "pause_high_water TEXT)"
     )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(tickets)")}
+    for name, declaration in _TICKET_EXTRA_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE tickets ADD COLUMN {name} {declaration}")
     conn.commit()
     return conn
+
+
+def _window_bounds(
+    day, start_minute: int, end_minute: int, tz
+) -> tuple[datetime, datetime]:
+    start = datetime(
+        day.year,
+        day.month,
+        day.day,
+        start_minute // 60,
+        start_minute % 60,
+        tzinfo=tz,
+    )
+    end = datetime(
+        day.year,
+        day.month,
+        day.day,
+        end_minute // 60,
+        end_minute % 60,
+        tzinfo=tz,
+    )
+    return start, end
+
+
+def _advance_within_windows(
+    anchor: datetime, start_minute: int, end_minute: int, remaining: timedelta
+) -> datetime:
+    """从 anchor 起累计服务时段内 remaining 时长，返回截止时刻。"""
+    if remaining <= timedelta(0):
+        return anchor
+    tz = anchor.tzinfo
+    day_start, day_end = _window_bounds(anchor.date(), start_minute, end_minute, tz)
+    if day_start <= anchor < day_end:
+        cursor = anchor
+    elif anchor < day_start:
+        cursor = day_start
+    else:
+        cursor = _window_bounds(
+            anchor.date() + timedelta(days=1), start_minute, end_minute, tz
+        )[0]
+
+    while True:
+        window_start, window_end = _window_bounds(
+            cursor.date(), start_minute, end_minute, tz
+        )
+        available = window_end - cursor
+        if remaining <= available:
+            return cursor + remaining
+        remaining -= available
+        cursor = _window_bounds(
+            cursor.date() + timedelta(days=1), start_minute, end_minute, tz
+        )[0]
 
 
 def _compute_deadline(
     created: datetime, start_minute: int, end_minute: int, quota_minutes: int
 ) -> datetime:
     """累计服务时段内时间，跨天时段逐日累加，返回响应截止时刻。"""
-    tz = created.tzinfo
+    return _advance_within_windows(
+        created, start_minute, end_minute, timedelta(minutes=quota_minutes)
+    )
 
-    def bounds(day) -> tuple[datetime, datetime]:
-        start = datetime(
-            day.year,
-            day.month,
-            day.day,
-            start_minute // 60,
-            start_minute % 60,
-            tzinfo=tz,
-        )
-        end = datetime(
-            day.year,
-            day.month,
-            day.day,
-            end_minute // 60,
-            end_minute % 60,
-            tzinfo=tz,
-        )
-        return start, end
 
-    day_start, day_end = bounds(created.date())
-    if day_start <= created < day_end:
-        cursor = created
-    elif created < day_start:
-        cursor = day_start
+def _window_time_between(
+    start: datetime, end: datetime, start_minute: int, end_minute: int
+) -> timedelta:
+    """[start, end] 内落在每日服务时段中的累计时长（两者须同一时区）。"""
+    if end <= start:
+        return timedelta(0)
+    total = timedelta(0)
+    day = start.date()
+    last = end.date()
+    one_day = timedelta(days=1)
+    while day <= last:
+        window_start, window_end = _window_bounds(
+            day, start_minute, end_minute, start.tzinfo
+        )
+        overlap = min(end, window_end) - max(start, window_start)
+        if overlap > timedelta(0):
+            total += overlap
+        day += one_day
+    return total
+
+
+def _parse_utc(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+_TICKET_SELECT = (
+    "SELECT t.id, t.priority, t.window_id, t.created_at, t.paused_at, t.resumed_at, "
+    "t.consumed_seconds, t.tz_offset_seconds, t.pause_high_water, "
+    "w.start_minute, w.end_minute "
+    "FROM tickets t JOIN windows w ON w.id = t.window_id"
+)
+
+
+def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
+    (
+        _id,
+        priority,
+        window_id,
+        created_at,
+        paused_at,
+        resumed_at,
+        consumed_seconds,
+        tz_offset_seconds,
+        _pause_high_water,
+        start_minute,
+        end_minute,
+    ) = row
+    tz = timezone(timedelta(seconds=tz_offset_seconds))
+    remaining = timedelta(minutes=SLA_MINUTES[priority]) - timedelta(
+        seconds=consumed_seconds
+    )
+    if paused_at is not None:
+        state = "paused"
+        anchor = _parse_utc(paused_at).astimezone(tz)
     else:
-        cursor = bounds(created.date() + timedelta(days=1))[0]
-
-    remaining = timedelta(minutes=quota_minutes)
-    while True:
-        window_start, window_end = bounds(cursor.date())
-        available = window_end - cursor
-        if remaining <= available:
-            return cursor + remaining
-        remaining -= available
-        cursor = bounds(cursor.date() + timedelta(days=1))[0]
-
-
-def _ticket_json(row: sqlite3.Row | tuple) -> dict:
-    _id, priority, window_id, created_at, deadline = row
+        state = "running"
+        if resumed_at is not None:
+            anchor = _parse_utc(resumed_at).astimezone(tz)
+        else:
+            anchor = _parse_utc(created_at).astimezone(tz)
+    deadline = _advance_within_windows(anchor, start_minute, end_minute, remaining)
     return {
         "id": _id,
         "priority": priority,
         "window_id": window_id,
         "created_at": created_at,
-        "deadline": deadline,
+        "deadline": _format_utc(deadline),
+        "state": state,
+        "paused_at": paused_at,
+        "resumed_at": resumed_at,
     }
 
 
@@ -232,18 +354,21 @@ def _ticket_create(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         )
         created_at_text = _format_utc(args.created_at)
         deadline_text = _format_utc(deadline)
+        tz_offset_seconds = int(args.created_at.utcoffset().total_seconds())
 
         try:
             with conn:
                 conn.execute(
-                    "INSERT INTO tickets (id, priority, window_id, created_at, deadline) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO tickets "
+                    "(id, priority, window_id, created_at, deadline, tz_offset_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         args.id,
                         args.priority,
                         args.window_id,
                         created_at_text,
                         deadline_text,
+                        tz_offset_seconds,
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -270,6 +395,12 @@ def _ticket_create(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     return 0
 
 
+def _fetch_ticket(conn: sqlite3.Connection, ticket_id: str):
+    return conn.execute(
+        _TICKET_SELECT + " WHERE t.id = ?", (ticket_id,)
+    ).fetchone()
+
+
 def _ticket_show(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     try:
         conn = _connect(args.db)
@@ -277,18 +408,14 @@ def _ticket_show(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
         print(f"sla-desk: error: 无法打开台账 {args.db!r}: {exc}", file=sys.stderr)
         return 1
     try:
-        row = conn.execute(
-            "SELECT id, priority, window_id, created_at, deadline "
-            "FROM tickets WHERE id = ?",
-            (args.id,),
-        ).fetchone()
+        row = _fetch_ticket(conn, args.id)
     finally:
         conn.close()
 
     if row is None:
         print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
         return 1
-    print(json.dumps(_ticket_json(row), separators=(",", ":")))
+    print(json.dumps(_ticket_payload(row), separators=(",", ":")))
     return 0
 
 
@@ -300,13 +427,164 @@ def _ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
         return 1
     try:
         rows = conn.execute(
-            "SELECT id, priority, window_id, created_at, deadline "
-            "FROM tickets ORDER BY created_at ASC, id ASC"
+            _TICKET_SELECT + " ORDER BY t.created_at ASC, t.id ASC"
         ).fetchall()
     finally:
         conn.close()
 
-    print(json.dumps([_ticket_json(row) for row in rows], separators=(",", ":")))
+    print(json.dumps([_ticket_payload(row) for row in rows], separators=(",", ":")))
+    return 0
+
+
+def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    try:
+        conn = _connect(args.db)
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: 无法打开台账 {args.db!r}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        row = _fetch_ticket(conn, args.id)
+        if row is None:
+            print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
+            return 1
+
+        payload = _ticket_payload(row)
+        if payload["state"] == "paused":
+            print(
+                f"sla-desk: error: 工单 {args.id!r} 已处于暂停状态",
+                file=sys.stderr,
+            )
+            return 2
+
+        at_utc = args.at.astimezone(timezone.utc)
+        if at_utc < _parse_utc(payload["created_at"]):
+            print(
+                f"sla-desk: error: --at 早于工单 {args.id!r} 的受理时刻",
+                file=sys.stderr,
+            )
+            return 2
+        if at_utc > _parse_utc(payload["deadline"]):
+            print(
+                f"sla-desk: error: --at 晚于工单 {args.id!r} 的当前响应截止",
+                file=sys.stderr,
+            )
+            return 2
+
+        (
+            _id,
+            priority,
+            _window_id,
+            created_at,
+            _paused_at,
+            resumed_at,
+            consumed_seconds,
+            tz_offset_seconds,
+            pause_high_water,
+            start_minute,
+            end_minute,
+        ) = row
+        tz = timezone(timedelta(seconds=tz_offset_seconds))
+        if resumed_at is not None:
+            anchor = _parse_utc(resumed_at).astimezone(tz)
+        else:
+            anchor = _parse_utc(created_at).astimezone(tz)
+        consumed = consumed_seconds + int(
+            _window_time_between(
+                anchor, at_utc.astimezone(tz), start_minute, end_minute
+            ).total_seconds()
+        )
+        at_text = _format_utc(at_utc)
+        if pause_high_water is None or at_text > pause_high_water:
+            pause_high_water = at_text
+        remaining = timedelta(minutes=SLA_MINUTES[priority]) - timedelta(
+            seconds=consumed
+        )
+        frozen = _advance_within_windows(
+            at_utc.astimezone(tz), start_minute, end_minute, remaining
+        )
+
+        with conn:
+            conn.execute(
+                "UPDATE tickets SET paused_at = ?, consumed_seconds = ?, "
+                "pause_high_water = ?, deadline = ? WHERE id = ?",
+                (at_text, consumed, pause_high_water, _format_utc(frozen), args.id),
+            )
+        payload = _ticket_payload(_fetch_ticket(conn, args.id))
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    print(json.dumps(payload, separators=(",", ":")))
+    return 0
+
+
+def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    try:
+        conn = _connect(args.db)
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: 无法打开台账 {args.db!r}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        row = _fetch_ticket(conn, args.id)
+        if row is None:
+            print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
+            return 1
+
+        payload = _ticket_payload(row)
+        if payload["state"] != "paused":
+            print(
+                f"sla-desk: error: 工单 {args.id!r} 未处于暂停状态",
+                file=sys.stderr,
+            )
+            return 2
+
+        at_utc = args.at.astimezone(timezone.utc)
+        pause_high_water = row[8]
+        if at_utc < _parse_utc(pause_high_water):
+            print(
+                f"sla-desk: error: --at 早于工单 {args.id!r} 的暂停时刻",
+                file=sys.stderr,
+            )
+            return 2
+
+        (
+            _id,
+            priority,
+            _window_id,
+            _created_at,
+            _paused_at,
+            _resumed_at,
+            consumed_seconds,
+            tz_offset_seconds,
+            _high_water,
+            start_minute,
+            end_minute,
+        ) = row
+        tz = timezone(timedelta(seconds=tz_offset_seconds))
+        remaining = timedelta(minutes=SLA_MINUTES[priority]) - timedelta(
+            seconds=consumed_seconds
+        )
+        deadline = _advance_within_windows(
+            at_utc.astimezone(tz), start_minute, end_minute, remaining
+        )
+        at_text = _format_utc(at_utc)
+
+        with conn:
+            conn.execute(
+                "UPDATE tickets SET paused_at = NULL, resumed_at = ?, deadline = ? "
+                "WHERE id = ?",
+                (at_text, _format_utc(deadline), args.id),
+            )
+        payload = _ticket_payload(_fetch_ticket(conn, args.id))
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    print(json.dumps(payload, separators=(",", ":")))
     return 0
 
 
@@ -320,5 +598,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):
-        parser.error("缺少子命令（window create / ticket create|show|list）")
+        parser.error("缺少子命令（window create / ticket create|pause|resume|show|list）")
     return args.handler(args, parser)

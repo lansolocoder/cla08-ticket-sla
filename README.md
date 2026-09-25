@@ -54,15 +54,35 @@ SLA 响应额度按优先级为 high/medium/low 分别 60/240/480 分钟。从 `
 
 时间字段统一输出 UTC ISO8601：带 `Z`、秒级精度、不带小数秒。
 
+## 暂停与恢复
+
+`ticket pause` / `ticket resume` 各接收 `--db`、`--id` 与 `--at`
+（带时区偏移的 ISO8601 时刻），计时口径与 deadline 相同：只累计服务时段内的时间。
+
+```bash
+python3 -m sla_desk ticket pause  --db ledger.db --id T-001 --at 2026-03-02T10:00:00+08:00
+python3 -m sla_desk ticket resume --db ledger.db --id T-001 --at 2026-03-02T14:00:00+08:00
+```
+
+- `pause` 在 `--at` 时刻停止累计；`--at` 早于受理时刻或晚于当前 deadline 时拒绝且不写库
+- `resume` 在 `--at` 恢复计时，按 `resumed_at` 之后服务时段内的时间补足剩余额度，
+  重算新截止；`--at` 早于暂停时刻（或此前已生效的更早暂停时刻）时拒绝且不写库
+- 重复 pause（已暂停）/ 重复 resume（未暂停）报错退出码 2；工单不存在报错退出码 1
+- 成功时退出码 0，stdout 输出与 `ticket show` 相同形状的一行 JSON
+
 ## 查询
 
-按 id 查询，stdout 输出与 create 相同形状的一行 JSON：
+按 id 查询，stdout 输出一行 JSON，包含 `id`、`priority`、`window_id`、`created_at`、
+`deadline`、`state`、`paused_at`、`resumed_at`。`state` 为 `running` 或 `paused`；
+未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。`deadline` 恒为按当前记录
+重算的有效截止：running 且从未暂停时与受理时算法一致，暂停中为按暂停时刻冻结的截止，
+恢复后为补足剩余额度后的新截止。
 
 ```bash
 python3 -m sla_desk ticket show --db ledger.db --id T-001
 ```
 
-列出全部工单，按 `created_at` 升序（相同时按 id 字典序）输出 JSON 数组；
+列出全部工单，数组元素形状与 show 相同，按 `created_at` 升序（相同时按 id 字典序）；
 空台账输出 `[]`：
 
 ```bash
