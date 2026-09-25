@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 
@@ -14,10 +15,12 @@ from . import __version__
 PRIORITIES = ("P1", "P2", "P3", "P4")
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 STATE_ACCEPTED = "accepted"
+STATE_PAUSED = "paused"
 
 EXIT_INVALID = 2
 EXIT_DUPLICATE = 3
 EXIT_NOT_FOUND = 4
+EXIT_CONFLICT = 5
 
 _TICKET_COLUMNS = "id, priority, title, response_minutes, state, created_at, paused_seconds"
 
@@ -44,6 +47,9 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(tickets)")}
+    if "paused_at" not in columns:
+        connection.execute("ALTER TABLE tickets ADD COLUMN paused_at TEXT")
     return connection
 
 
@@ -65,12 +71,30 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _utc_time(value: str) -> datetime:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid UTC time (expect YYYY-MM-DDThh:mm:ssZ): {value!r}"
+        )
+    try:
+        return datetime.strptime(value, TIME_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid UTC time: {value!r}") from None
+
+
+def _parse_time(text: str) -> datetime:
+    return datetime.strptime(text, TIME_FORMAT).replace(tzinfo=timezone.utc)
+
+
 def _ticket_json(row: tuple) -> dict:
     ticket_id, priority, title, response_minutes, state, created_at, paused_seconds = row
     response_due_at = None
     if created_at is not None and response_minutes is not None:
-        start = datetime.strptime(created_at, TIME_FORMAT).replace(tzinfo=timezone.utc)
-        response_due_at = (start + timedelta(minutes=response_minutes)).strftime(TIME_FORMAT)
+        start = _parse_time(created_at)
+        due = start + timedelta(
+            minutes=response_minutes, seconds=paused_seconds or 0
+        )
+        response_due_at = due.strftime(TIME_FORMAT)
     return {
         "id": ticket_id,
         "priority": priority,
@@ -138,6 +162,64 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pause(args: argparse.Namespace) -> int:
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT state FROM tickets WHERE id = ?", (args.id,)
+        ).fetchone()
+        if row is None:
+            print(f"error: 工单不存在: {args.id}", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        if row[0] == STATE_PAUSED:
+            print(f"error: 工单已处于暂停状态，拒绝重复暂停: {args.id}", file=sys.stderr)
+            return EXIT_CONFLICT
+        with connection:
+            connection.execute(
+                "UPDATE tickets SET state = ?, paused_at = ? WHERE id = ?",
+                (STATE_PAUSED, args.at.strftime(TIME_FORMAT), args.id),
+            )
+    finally:
+        connection.close()
+    print(f"paused {args.id} {STATE_PAUSED}")
+    return 0
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT state, created_at, paused_at, paused_seconds"
+            " FROM tickets WHERE id = ?",
+            (args.id,),
+        ).fetchone()
+        if row is None:
+            print(f"error: 工单不存在: {args.id}", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        state, created_at, paused_at, paused_seconds = row
+        if state != STATE_PAUSED:
+            print(f"error: 工单未处于暂停状态，拒绝恢复: {args.id}", file=sys.stderr)
+            return EXIT_CONFLICT
+        last_pause = _parse_time(paused_at)
+        created = _parse_time(created_at)
+        if args.at < last_pause or args.at < created:
+            print(
+                f"error: 恢复时刻早于最近一次暂停时刻或创建时刻: {args.id}",
+                file=sys.stderr,
+            )
+            return EXIT_NOT_FOUND  # 时刻不合法，沿用退出码 4
+        interval = int((args.at - last_pause).total_seconds())
+        with connection:
+            connection.execute(
+                "UPDATE tickets SET state = ?, paused_seconds = ? WHERE id = ?",
+                (STATE_ACCEPTED, paused_seconds + interval, args.id),
+            )
+    finally:
+        connection.close()
+    print(f"resumed {args.id} {STATE_ACCEPTED}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sla-desk",
@@ -165,6 +247,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help="按创建时间升序列出全部工单")
     list_parser.set_defaults(handler=_cmd_list)
+
+    pause = subparsers.add_parser("pause", help="暂停工单 SLA 计时")
+    pause.add_argument("--id", required=True, type=_non_empty, help="工单号")
+    pause.add_argument(
+        "--at",
+        required=True,
+        type=_utc_time,
+        help="暂停时刻（UTC，YYYY-MM-DDThh:mm:ssZ）",
+    )
+    pause.set_defaults(handler=_cmd_pause)
+
+    resume = subparsers.add_parser("resume", help="恢复工单 SLA 计时")
+    resume.add_argument("--id", required=True, type=_non_empty, help="工单号")
+    resume.add_argument(
+        "--at",
+        required=True,
+        type=_utc_time,
+        help="恢复时刻（UTC，YYYY-MM-DDThh:mm:ssZ）",
+    )
+    resume.set_defaults(handler=_cmd_resume)
 
     return parser
 
