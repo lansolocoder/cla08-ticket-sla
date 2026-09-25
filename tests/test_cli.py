@@ -136,6 +136,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "2026-03-02T09:15:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
@@ -158,6 +159,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "medium", "--window-id", "w1",
             "--created-at", "2026-03-02T17:00:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -171,6 +173,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "low", "--window-id", "w1",
             "--created-at", "2026-03-02T08:00:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -183,6 +186,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "2026-03-02T20:00:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -195,6 +199,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "2026-03-02T18:00:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -208,6 +213,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "wshort",
             "--created-at", "2026-03-02T09:00:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -220,6 +226,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "2026-03-02T09:15:00+05:30",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
@@ -234,6 +241,7 @@ class LedgerTests(unittest.TestCase):
                     "ticket", "create", "--db", self.db,
                     "--id", "t" + bad, "--priority", bad, "--window-id", "w1",
                     "--created-at", "2026-03-02T09:15:00+08:00",
+                    "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
@@ -245,6 +253,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "2026-03-02T09:15:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
@@ -257,6 +266,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "not-a-time",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
@@ -268,6 +278,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "nope",
             "--created-at", "2026-03-02T09:15:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
@@ -280,12 +291,14 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "2026-03-02T09:15:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(first.returncode, 0)
         result = self.invoke(
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "low", "--window-id", "w1",
             "--created-at", "2026-03-03T09:15:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
@@ -305,6 +318,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", "t1", "--priority", "high", "--window-id", "w1",
             "--created-at", "2026-03-02T09:15:00+08:00",
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
         result = self.invoke("ticket", "show", "--db", self.db, "--id", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -319,6 +333,8 @@ class LedgerTests(unittest.TestCase):
                 "state": "running",
                 "paused_at": None,
                 "resumed_at": None,
+                "level": "q1",
+                "escalations": [],
             },
         )
         self.assertEqual(result.stderr, "")
@@ -342,6 +358,7 @@ class LedgerTests(unittest.TestCase):
                 "ticket", "create", "--db", self.db,
                 "--id", tid, "--priority", "high", "--window-id", "w1",
                 "--created-at", created,
+                "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -354,7 +371,7 @@ class LedgerTests(unittest.TestCase):
                 set(row),
                 {
                     "id", "priority", "window_id", "created_at", "deadline",
-                    "state", "paused_at", "resumed_at",
+                    "state", "paused_at", "resumed_at", "level", "escalations",
                 },
             )
 
@@ -375,6 +392,7 @@ class LedgerTests(unittest.TestCase):
             "ticket", "create", "--db", self.db,
             "--id", tid, "--priority", priority, "--window-id", "w1",
             "--created-at", created,
+            "--tier1", "q1", "--tier2", "q2", "--tier3", "q3",
         )
 
     def pause(self, tid: str, at: str):
@@ -407,6 +425,8 @@ class LedgerTests(unittest.TestCase):
                 "state": "paused",
                 "paused_at": "2026-03-02T01:45:00Z",
                 "resumed_at": None,
+                "level": "q1",
+                "escalations": [],
             },
         )
         self.assertEqual(self.show("t1"), payload)
@@ -440,6 +460,8 @@ class LedgerTests(unittest.TestCase):
                 "state": "running",
                 "paused_at": None,
                 "resumed_at": "2026-03-02T06:00:00Z",
+                "level": "q1",
+                "escalations": [],
             },
         )
         self.assertEqual(self.show("t1"), payload)
@@ -573,6 +595,154 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNone(rows[1]["paused_at"])
         self.assertIsNone(rows[1]["resumed_at"])
 
+    # --- escalation tiers --------------------------------------------------
+
+    def test_create_with_duplicate_tiers_is_rc2_and_not_written(self) -> None:
+        self.create_window()
+        for tiers in [("q1", "q1", "q3"), ("q1", "q2", "q2"), ("q2", "q2", "q2")]:
+            with self.subTest(tiers=tiers):
+                result = self.invoke(
+                    "ticket", "create", "--db", self.db,
+                    "--id", "t1", "--priority", "high", "--window-id", "w1",
+                    "--created-at", "2026-03-02T09:15:00+08:00",
+                    "--tier1", tiers[0], "--tier2", tiers[1], "--tier3", tiers[2],
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.ticket_count(), 0)
+
+    def test_create_with_invalid_tier_value_rejected_and_not_written(self) -> None:
+        self.create_window()
+        for bad in ["Q1", "q 1", "q_1", "", "a" * 17, "队列"]:
+            with self.subTest(bad=bad):
+                result = self.invoke(
+                    "ticket", "create", "--db", self.db,
+                    "--id", "t1", "--priority", "high", "--window-id", "w1",
+                    "--created-at", "2026-03-02T09:15:00+08:00",
+                    "--tier1", bad, "--tier2", "q2", "--tier3", "q3",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.ticket_count(), 0)
+
+    # --- escalate ------------------------------------------------------------
+
+    def escalate(self, tid: str, at: str):
+        return self.invoke(
+            "ticket", "escalate", "--db", self.db, "--id", tid, "--at", at
+        )
+
+    def test_escalate_advances_one_level_and_records_history(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalate("t1", "2026-03-02T10:15:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "id": "t1",
+                "level": "q2",
+                "history": [
+                    {"from": "q1", "to": "q2", "at": "2026-03-02T02:15:00Z"}
+                ],
+            },
+        )
+        shown = self.show("t1")
+        self.assertEqual(shown["level"], "q2")
+        self.assertEqual(
+            shown["escalations"],
+            [{"from": "q1", "to": "q2", "at": "2026-03-02T02:15:00Z"}],
+        )
+        # 升级不影响 deadline
+        self.assertEqual(shown["deadline"], "2026-03-02T02:15:00Z")
+
+    def test_escalate_progresses_through_all_tiers_then_rc2(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(
+            self.escalate("t1", "2026-03-02T10:15:00+08:00").returncode, 0
+        )
+        result = self.escalate("t1", "2026-03-02T11:00:00+08:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "id": "t1",
+                "level": "q3",
+                "history": [
+                    {"from": "q1", "to": "q2", "at": "2026-03-02T02:15:00Z"},
+                    {"from": "q2", "to": "q3", "at": "2026-03-02T03:00:00Z"},
+                ],
+            },
+        )
+        before = self.show("t1")
+        result = self.escalate("t1", "2026-03-02T12:00:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("t1", result.stderr)
+        self.assertEqual(self.show("t1"), before)
+
+    def test_escalate_before_deadline_rejected_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        before = self.show("t1")
+        result = self.escalate("t1", "2026-03-02T10:14:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("t1"), before)
+
+    def test_escalate_before_created_rejected_and_not_written(self) -> None:
+        self.create_window()
+        # low = 480 分钟，deadline 远晚于受理时刻；--at 早于受理时刻必被拒绝
+        self.create_ticket(priority="low")
+        before = self.show("t1")
+        result = self.escalate("t1", "2026-03-02T09:00:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("t1"), before)
+
+    def test_escalate_paused_ticket_rejected_and_not_written(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        self.assertEqual(self.pause("t1", "2026-03-02T09:45:00+08:00").returncode, 0)
+        before = self.show("t1")
+        result = self.escalate("t1", "2026-03-02T10:30:00+08:00")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.show("t1"), before)
+
+    def test_escalate_missing_ticket_is_rc1(self) -> None:
+        self.create_window()
+        result = self.escalate("ghost", "2026-03-02T10:00:00+08:00")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("ghost", result.stderr)
+
+    def test_escalate_at_converted_to_utc(self) -> None:
+        self.create_window()
+        self.create_ticket()
+        result = self.escalate("t1", "2026-03-02T15:45:00+05:30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["history"][0]["at"], "2026-03-02T10:15:00Z"
+        )
+
+    def test_list_reflects_escalation_state(self) -> None:
+        self.create_window()
+        self.create_ticket("a", created="2026-03-02T09:00:00+08:00")
+        self.create_ticket("b", created="2026-03-02T09:30:00+08:00")
+        self.assertEqual(self.escalate("a", "2026-03-02T10:00:00+08:00").returncode, 0)
+        result = self.invoke("ticket", "list", "--db", self.db)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual(rows[0]["level"], "q2")
+        self.assertEqual(
+            rows[0]["escalations"],
+            [{"from": "q1", "to": "q2", "at": "2026-03-02T02:00:00Z"}],
+        )
+        self.assertEqual(rows[1]["level"], "q1")
+        self.assertEqual(rows[1]["escalations"], [])
+
     # --- global rules ------------------------------------------------------
 
     def test_db_is_required(self) -> None:
@@ -580,7 +750,8 @@ class LedgerTests(unittest.TestCase):
             ("ticket", "list"),
             ("ticket", "show", "--id", "t1"),
             ("ticket", "create", "--id", "t1", "--priority", "high",
-             "--window-id", "w1", "--created-at", "2026-03-02T09:15:00+08:00"),
+             "--window-id", "w1", "--created-at", "2026-03-02T09:15:00+08:00",
+             "--tier1", "q1", "--tier2", "q2", "--tier3", "q3"),
             ("window", "create", "--id", "w1", "--start", "09:00", "--end", "18:00"),
         ]:
             with self.subTest(invocation=invocation):

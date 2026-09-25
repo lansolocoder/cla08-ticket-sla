@@ -31,11 +31,14 @@ python3 -m sla_desk window create --db ledger.db \
 - `--priority`：`high` | `medium` | `low`（精确小写），其他取值报错且不写库
 - `--window-id`：引用已登记的服务时段，不存在则整条创建失败
 - `--created-at`：带时区偏移的 ISO8601 时刻，如 `2026-03-02T09:15:00+08:00`
+- `--tier1` / `--tier2` / `--tier3`：由高到低三级升级目标队列，取值为不带空白的
+  小写字母数字串（1–16 字符），三个值必须互不相同，否则登记失败（退出码 2）、不写库
 
 ```bash
 python3 -m sla_desk ticket create --db ledger.db \
     --id T-001 --priority high --window-id business-hours \
-    --created-at 2026-03-02T09:15:00+08:00
+    --created-at 2026-03-02T09:15:00+08:00 \
+    --tier1 tier1 --tier2 tier2 --tier3 tier3
 ```
 
 成功时退出码 0，stdout 输出一行工单 JSON：
@@ -70,13 +73,38 @@ python3 -m sla_desk ticket resume --db ledger.db --id T-001 --at 2026-03-02T14:0
 - 重复 pause（已暂停）/ 重复 resume（未暂停）报错退出码 2；工单不存在报错退出码 1
 - 成功时退出码 0，stdout 输出与 `ticket show` 相同形状的一行 JSON
 
+## 升级
+
+`ticket escalate` 接收 `--db`、`--id` 与 `--at`（带时区偏移的 ISO8601 时刻），
+把到期未响应的工单转入下一级升级目标队列并记录一条升级记录：
+
+```bash
+python3 -m sla_desk ticket escalate --db ledger.db --id T-001 --at 2026-03-02T11:15:00+08:00
+```
+
+- 工单状态为 `running` 且 `--at` 不早于其当前有效 deadline 才可升级，否则拒绝且不写库；
+  `--at` 早于受理时刻同样拒绝；暂停中的工单不可升级
+- 已处于 tier3 的工单再次升级拒绝（退出码 2），不产生新记录；工单不存在退出码 1
+- 同一工单可多次升级，逐级推进（tier1 → tier2 → tier3）；升级不影响 deadline 计算
+  与暂停/恢复规则
+- 成功时退出码 0，stdout 输出一行 JSON，`level` 为当前队列，`history` 按 `at` 升序
+  列出全部升级记录（时刻统一为 UTC ISO8601，带 `Z`、秒级）：
+
+```json
+{"id":"T-001","level":"tier2","history":[{"from":"tier1","to":"tier2","at":"2026-03-02T03:15:00Z"}]}
+```
+
+失败时 stdout 为空、退出码非零、stderr 说明原因，工单记录与已有升级记录保持不变。
+
 ## 查询
 
 按 id 查询，stdout 输出一行 JSON，包含 `id`、`priority`、`window_id`、`created_at`、
-`deadline`、`state`、`paused_at`、`resumed_at`。`state` 为 `running` 或 `paused`；
-未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。`deadline` 恒为按当前记录
-重算的有效截止：running 且从未暂停时与受理时算法一致，暂停中为按暂停时刻冻结的截止，
-恢复后为补足剩余额度后的新截止。
+`deadline`、`state`、`paused_at`、`resumed_at`、`level`、`escalations`。`state` 为
+`running` 或 `paused`；未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。
+`level` 为当前升级目标队列（初始为 tier1 登记的队列），`escalations` 为按 `at` 升序的
+升级记录数组（从未升级时为空数组 `[]`），元素形状与 escalate 输出的 `history` 相同。
+`deadline` 恒为按当前记录重算的有效截止：running 且从未暂停时与受理时算法一致，
+暂停中为按暂停时刻冻结的截止，恢复后为补足剩余额度后的新截止。
 
 ```bash
 python3 -m sla_desk ticket show --db ledger.db --id T-001
