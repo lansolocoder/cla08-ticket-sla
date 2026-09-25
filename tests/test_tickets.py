@@ -245,6 +245,152 @@ class TicketCliTests(unittest.TestCase):
             self.assertIn("状态: open", self.invoke(cwd, "show", "T3").stdout)
 
     # ------------------------------------------------------------------
+    # 暂停 / 恢复
+    # ------------------------------------------------------------------
+
+    def test_show_prints_sla_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1", priority="P1",
+                          submitted_at="2026-09-24T10:00:00+08:00")
+            show = self.invoke(cwd, "show", "T1")
+            self.assertEqual(show.returncode, 0, show.stderr)
+            self.assertIn("响应截止: 2026-09-24T10:15:00+08:00", show.stdout)
+            self.assertRegex(show.stdout, r"已耗时: \d+ 分钟")
+            self.assertRegex(show.stdout, r"剩余: \d+ 分钟")
+
+    def test_pause_then_resume_output_and_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1", priority="P1",
+                          submitted_at="2026-09-24T10:00:00+08:00")
+            pause = self.invoke(cwd, "pause", "T1", "2026-09-24T10:05:00+08:00")
+            self.assertEqual(pause.returncode, 0, pause.stderr)
+            self.assertIn("状态: paused", pause.stdout)
+            self.assertIn("暂停时刻: 2026-09-24T10:05:00+08:00", pause.stdout)
+
+            paused_show = self.invoke(cwd, "show", "T1")
+            self.assertIn("状态: paused", paused_show.stdout)
+            # 暂停期间剩余冻结为 10 分钟、已耗 5 分钟
+            self.assertIn("已耗时: 5 分钟", paused_show.stdout)
+            self.assertIn("剩余: 10 分钟", paused_show.stdout)
+
+            # 暂停中的工单不在 open 列表
+            self.assertEqual(self.invoke(cwd, "list").stdout, "")
+
+            resume = self.invoke(cwd, "resume", "T1", "2026-09-24T11:30:00+08:00")
+            self.assertEqual(resume.returncode, 0, resume.stderr)
+            self.assertIn("状态: open", resume.stdout)
+            self.assertIn("恢复时刻: 2026-09-24T11:30:00+08:00", resume.stdout)
+
+            resumed_show = self.invoke(cwd, "show", "T1")
+            self.assertIn("状态: open", resumed_show.stdout)
+            # 截止顺延：11:30 恢复后再计剩余 10 分钟
+            self.assertIn("响应截止: 2026-09-24T11:40:00+08:00", resumed_show.stdout)
+
+    def test_double_pause_fails_without_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd)
+            self.assertEqual(
+                self.invoke(cwd, "pause", "T1", "2026-09-24T10:05:00+08:00").returncode, 0
+            )
+            again = self.invoke(cwd, "pause", "T1", "2026-09-24T10:06:00+08:00")
+            self.assertEqual(again.returncode, 1)
+            self.assertEqual(again.stdout, "")
+            self.assertIn("open", again.stderr)
+            # 状态仍为 paused，暂停时刻文本未被改写
+            show = self.invoke(cwd, "show", "T1")
+            self.assertIn("状态: paused", show.stdout)
+            self.assertIn("已耗时: 5 分钟", show.stdout)
+
+    def test_resume_without_pause_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd)
+            result = self.invoke(cwd, "resume", "T1", "2026-09-24T10:05:00+08:00")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("paused", result.stderr)
+            self.assertIn("状态: open", self.invoke(cwd, "show", "T1").stdout)
+
+    def test_pause_merged_ticket_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1")
+            self.register(cwd, request_no="CR-2", title="b")
+            self.invoke(cwd, "merge", "T2", "T1")
+            for cmd in ("pause", "resume"):
+                with self.subTest(cmd=cmd):
+                    result = self.invoke(cwd, cmd, "T2", "2026-09-24T12:00:00+08:00")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("merged", result.stderr)
+
+    def test_pause_time_before_submission_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, submitted_at="2026-09-24T10:00:00+08:00")
+            result = self.invoke(cwd, "pause", "T1", "2026-09-24T09:00:00+08:00")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("提交时刻", result.stderr)
+            self.assertIn("状态: open", self.invoke(cwd, "show", "T1").stdout)
+
+    def test_out_of_order_resume_fails_without_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd)
+            self.invoke(cwd, "pause", "T1", "2026-09-24T10:05:00+08:00")
+            # 恢复时刻早于本次暂停起点
+            bad = self.invoke(cwd, "resume", "T1", "2026-09-24T10:04:00+08:00")
+            self.assertEqual(bad.returncode, 1)
+            self.assertEqual(bad.stdout, "")
+            self.assertIn("上一操作时刻", bad.stderr)
+            # 仍处于暂停，冻结值不变
+            show = self.invoke(cwd, "show", "T1")
+            self.assertIn("状态: paused", show.stdout)
+            self.assertIn("剩余: 10 分钟", show.stdout)
+
+    def test_pause_resume_unknown_and_malformed_ticket_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd)
+            for cmd, args in [
+                ("pause", ("T9", "2026-09-24T10:05:00+08:00")),
+                ("resume", ("T9", "2026-09-24T10:05:00+08:00")),
+                ("pause", ("XYZ", "2026-09-24T10:05:00+08:00")),
+            ]:
+                with self.subTest(cmd=cmd, args=args):
+                    result = self.invoke(cwd, cmd, *args)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+
+    def test_unparseable_time_fails_and_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd)
+            for cmd in ("pause", "resume"):
+                with self.subTest(cmd=cmd):
+                    result = self.invoke(cwd, cmd, "T1", "not-a-time")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("时刻无法解析", result.stderr)
+            self.assertIn("状态: open", self.invoke(cwd, "show", "T1").stdout)
+
+    def test_timestamp_text_is_stored_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, submitted_at="2026-09-24T10:00:00+08:00")
+            # 同一绝对时刻、不同文本（Z 形式）也可正常配对，且成功回显原文本
+            pause = self.invoke(cwd, "pause", "T1", "2026-09-24T02:05:00Z")
+            self.assertEqual(pause.returncode, 0, pause.stderr)
+            self.assertIn("暂停时刻: 2026-09-24T02:05:00Z", pause.stdout)
+            resume = self.invoke(cwd, "resume", "T1", "2026-09-24T03:30:00Z")
+            self.assertEqual(resume.returncode, 0, resume.stderr)
+            self.assertIn("恢复时刻: 2026-09-24T03:30:00Z", resume.stdout)
+
+    # ------------------------------------------------------------------
     # 列出
     # ------------------------------------------------------------------
 

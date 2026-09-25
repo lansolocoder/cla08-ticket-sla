@@ -13,10 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import sla
+
 DB_FILENAME = "sla-desk.db"
 
 STATUS_OPEN = "open"
 STATUS_MERGED = "merged"
+STATUS_PAUSED = "paused"
 
 VALID_PRIORITIES = ("P1", "P2", "P3", "P4")
 
@@ -47,6 +50,14 @@ class DuplicateConflict(StoreError):
 
 class MergeConflict(StoreError):
     """合并前置条件不满足（不存在/非 open/同一单/已合并）。"""
+
+
+class InvalidTimestamp(StoreError):
+    """pause/resume 时刻无法解析为 ISO 8601。"""
+
+
+class PauseResumeError(StoreError):
+    """暂停/恢复前置条件不满足（状态不符或时刻乱序）。"""
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,17 @@ class Store:
                 merged_into  TEXT,
                 merged_at    TEXT,
                 FOREIGN KEY (merged_into) REFERENCES tickets(ticket_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sla_events (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id TEXT NOT NULL,
+                kind      TEXT NOT NULL,
+                at_raw    TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES tickets(ticket_id)
             )
             """
         )
@@ -236,6 +258,91 @@ class Store:
             "SELECT * FROM tickets WHERE status = 'open' ORDER BY seq"
         ).fetchall()
         return [_row_to_ticket(row) for row in rows]
+
+    def events(self, ticket_id: str) -> list[tuple[str, str]]:
+        """返回工单的 pause/resume 事件（kind, 原始时刻文本），按发生先后排列。"""
+        rows = self._conn.execute(
+            "SELECT kind, at_raw FROM sla_events WHERE ticket_id = ? ORDER BY id",
+            (ticket_id,),
+        ).fetchall()
+        return [(row["kind"], row["at_raw"]) for row in rows]
+
+    def pause(self, ticket_id: str, at_raw: str) -> Ticket:
+        """暂停工单：仅 open 工单可暂停，时刻不早于提交时刻且不早于上一事件。
+
+        时刻文本原样保存。任一前置条件不满足则抛异常、回滚，库中不新增事件。
+        """
+        return self._add_event(ticket_id, at_raw, "pause")
+
+    def resume(self, ticket_id: str, at_raw: str) -> Ticket:
+        """恢复工单：仅 paused 工单可恢复，时刻不早于本次暂停起点。
+
+        时刻文本原样保存。任一前置条件不满足则抛异常、回滚，库中不新增事件。
+        """
+        return self._add_event(ticket_id, at_raw, "resume")
+
+    def _add_event(self, ticket_id: str, at_raw: str, kind: str) -> Ticket:
+        key = normalize_ticket_id(ticket_id)
+        try:
+            at_abs = sla.parse_iso8601(at_raw).abs_dt
+        except (ValueError, TypeError):
+            raise InvalidTimestamp(
+                f"时刻无法解析，应为 ISO 8601 格式（如 2026-09-24T10:00:00+08:00）：{at_raw!r}"
+            )
+
+        with self._transaction() as conn:
+            ticket = _load(conn, key)
+            if kind == "pause":
+                if ticket.status != STATUS_OPEN:
+                    raise PauseResumeError(
+                        f"只有 open 状态的工单可以暂停：{key} 当前状态为 {ticket.status}"
+                    )
+                new_status = STATUS_PAUSED
+            else:
+                if ticket.status != STATUS_PAUSED:
+                    raise PauseResumeError(
+                        f"只有 paused 状态的工单可以恢复：{key} 当前状态为 {ticket.status}"
+                    )
+                new_status = STATUS_OPEN
+
+            submitted_abs = sla.parse_iso8601(ticket.submitted_at).abs_dt
+            if at_abs < submitted_abs:
+                raise PauseResumeError(
+                    f"时刻 {at_raw} 早于工单提交时刻 {ticket.submitted_at}，拒绝{kind}"
+                )
+
+            last_row = conn.execute(
+                "SELECT at_raw FROM sla_events WHERE ticket_id = ? ORDER BY id DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+            if last_row is not None:
+                last_abs = sla.parse_iso8601(last_row["at_raw"]).abs_dt
+                if at_abs < last_abs:
+                    raise PauseResumeError(
+                        f"时刻 {at_raw} 早于上一操作时刻 {last_row['at_raw']}，"
+                        f"拒绝乱序{kind}"
+                    )
+
+            conn.execute(
+                "INSERT INTO sla_events (ticket_id, kind, at_raw) VALUES (?, ?, ?)",
+                (key, kind, at_raw),
+            )
+            conn.execute(
+                "UPDATE tickets SET status = ? WHERE ticket_id = ?",
+                (new_status, key),
+            )
+            conn.execute("COMMIT")
+            return Ticket(
+                ticket_id=ticket.ticket_id,
+                request_no=ticket.request_no,
+                title=ticket.title,
+                email=ticket.email,
+                priority=ticket.priority,
+                submitted_at=ticket.submitted_at,
+                status=new_status,
+                merged_into=ticket.merged_into,
+                merged_at=ticket.merged_at,
+            )
 
 
 # ----------------------------------------------------------------------
