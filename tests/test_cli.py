@@ -93,6 +93,7 @@ class TicketLedgerTests(unittest.TestCase):
                 "created_at",
                 "response_due_at",
                 "paused_seconds",
+                "escalations",
             ],
         )
         self.assertEqual(ticket["id"], "INC-1")
@@ -278,6 +279,265 @@ class PauseResumeTests(unittest.TestCase):
         listed = [json.loads(line) for line in self.invoke("list").stdout.splitlines()]
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0], self.status())
+
+
+class EscalateTests(unittest.TestCase):
+    FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "sla_desk.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, SLA_DESK_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "sla_desk", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    def register(self, ticket_id: str, priority: str = "P1", minutes: str = "30") -> dict:
+        result = self.invoke(
+            "register", "--id", ticket_id, "--priority", priority,
+            "--title", "示例工单", "--response-minutes", minutes,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(self.invoke("status", "--id", ticket_id).stdout)
+
+    def status(self, ticket_id: str) -> dict:
+        result = self.invoke("status", "--id", ticket_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def at(self, ticket: dict, **delta) -> str:
+        from datetime import datetime, timedelta
+
+        due = datetime.strptime(ticket["response_due_at"], self.FMT)
+        return (due + timedelta(**delta)).strftime(self.FMT)
+
+    def test_not_due_keeps_accepted_and_outputs_nothing(self) -> None:
+        ticket = self.register("INC-10")
+        result = self.invoke("escalate", "--at", self.at(ticket, seconds=-1))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.status("INC-10")["state"], "accepted")
+        self.assertEqual(self.status("INC-10")["escalations"], [])
+
+    def test_exactly_due_escalates_l1(self) -> None:
+        ticket = self.register("INC-11", priority="P1")
+        moment = self.at(ticket, seconds=0)
+        result = self.invoke("escalate", "--at", moment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                {
+                    "id": "INC-11",
+                    "priority": "P1",
+                    "state": "escalated",
+                    "escalated_at": moment,
+                }
+            ],
+        )
+        self.assertEqual(
+            list(lines[0]), ["id", "priority", "state", "escalated_at"]
+        )
+        record = self.status("INC-11")
+        self.assertEqual(record["state"], "escalated")
+        self.assertEqual(record["escalations"], [{"at": moment, "level": "L1"}])
+        self.assertEqual(
+            list(record),
+            [
+                "id",
+                "priority",
+                "title",
+                "response_minutes",
+                "state",
+                "created_at",
+                "response_due_at",
+                "paused_seconds",
+                "escalations",
+            ],
+        )
+
+    def test_level_thresholds(self) -> None:
+        from datetime import datetime, timedelta
+
+        cases = [
+            ("P1", 3600, "L1"),
+            ("P1", 3601, "L2"),
+            ("P2", 7200, "L1"),
+            ("P2", 7201, "L2"),
+            ("P3", 14400, "L1"),
+            ("P3", 14401, "L2"),
+            ("P4", 14400, "L1"),
+            ("P4", 14401, "L2"),
+        ]
+        for index, (priority, overdue_seconds, level) in enumerate(cases):
+            with self.subTest(priority=priority, overdue=overdue_seconds):
+                ticket_id = f"INC-L{index}"
+                ticket = self.register(ticket_id, priority=priority)
+                due = datetime.strptime(ticket["response_due_at"], self.FMT)
+                moment = (due + timedelta(seconds=overdue_seconds)).strftime(self.FMT)
+                result = self.invoke("escalate", "--at", moment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = json.loads(result.stdout)
+                self.assertEqual(output["id"], ticket_id)
+                self.assertEqual(
+                    self.status(ticket_id)["escalations"],
+                    [{"at": moment, "level": level}],
+                )
+
+    def test_paused_ticket_is_not_escalated_even_past_due(self) -> None:
+        ticket = self.register("INC-20")
+        self.assertEqual(
+            self.invoke(
+                "pause", "--id", "INC-20",
+                "--at", self.at(ticket, seconds=-600),
+            ).returncode,
+            0,
+        )
+        result = self.invoke("escalate", "--at", self.at(ticket, hours=2))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        record = self.status("INC-20")
+        self.assertEqual(record["state"], "paused")
+        self.assertEqual(record["escalations"], [])
+
+    def test_resumed_ticket_uses_shifted_due(self) -> None:
+        from datetime import datetime, timedelta
+
+        ticket = self.register("INC-21")
+        pause_at = self.at(ticket, seconds=-600)
+        resume_at = (
+            datetime.strptime(pause_at, self.FMT) + timedelta(seconds=300)
+        ).strftime(self.FMT)
+        self.invoke("pause", "--id", "INC-21", "--at", pause_at)
+        self.invoke("resume", "--id", "INC-21", "--at", resume_at)
+        resumed = self.status("INC-21")
+
+        before_new_due = (
+            datetime.strptime(resumed["response_due_at"], self.FMT)
+            - timedelta(seconds=1)
+        ).strftime(self.FMT)
+        result = self.invoke("escalate", "--at", before_new_due)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.status("INC-21")["state"], "accepted")
+
+        at_new_due = resumed["response_due_at"]
+        result = self.invoke("escalate", "--at", at_new_due)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["id"], "INC-21")
+        self.assertEqual(
+            self.status("INC-21")["escalations"],
+            [{"at": at_new_due, "level": "L1"}],
+        )
+
+    def test_mixed_tickets_and_output_order(self) -> None:
+        from datetime import datetime, timedelta
+
+        first = self.register("INC-30", priority="P1")
+        second = self.register("INC-31", priority="P2")
+        third = self.register("INC-32", priority="P3")
+        self.invoke(
+            "pause", "--id", "INC-31",
+            "--at", self.at(second, seconds=-10),
+        )
+        moment = (
+            datetime.strptime(third["response_due_at"], self.FMT)
+            + timedelta(seconds=3601)
+        ).strftime(self.FMT)
+        result = self.invoke("escalate", "--at", moment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([line["id"] for line in lines], ["INC-30", "INC-32"])
+        self.assertTrue(all(line["state"] == "escalated" for line in lines))
+        self.assertTrue(all(line["escalated_at"] == moment for line in lines))
+        self.assertEqual(self.status("INC-31")["state"], "paused")
+        self.assertEqual(self.status("INC-30")["escalations"][0]["level"], "L2")
+        self.assertEqual(self.status("INC-32")["escalations"][0]["level"], "L1")
+
+    def test_repeat_escalate_is_idempotent(self) -> None:
+        from datetime import datetime, timedelta
+
+        ticket = self.register("INC-40")
+        first = self.at(ticket, seconds=1)
+        self.assertEqual(self.invoke("escalate", "--at", first).returncode, 0)
+        second = (
+            datetime.strptime(first, self.FMT) + timedelta(hours=5)
+        ).strftime(self.FMT)
+        result = self.invoke("escalate", "--at", second)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        record = self.status("INC-40")
+        self.assertEqual(record["state"], "escalated")
+        self.assertEqual(len(record["escalations"]), 1)
+        self.assertEqual(record["escalations"][0]["at"], first)
+
+    def test_list_matches_status_and_includes_escalations(self) -> None:
+        from datetime import datetime, timedelta
+
+        ticket = self.register("INC-50")
+        moment = (
+            datetime.strptime(ticket["response_due_at"], self.FMT)
+            + timedelta(seconds=1)
+        ).strftime(self.FMT)
+        self.invoke("escalate", "--at", moment)
+        listed = [json.loads(line) for line in self.invoke("list").stdout.splitlines()]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0], self.status("INC-50"))
+        self.assertEqual(
+            listed[0]["escalations"], [{"at": moment, "level": "L1"}]
+        )
+
+    def test_invalid_time_format_exit_2_and_no_changes(self) -> None:
+        self.register("INC-60")
+        for moment in ("2026-09-25 10:00:00", "2026-09-25T10:00:00", "x", ""):
+            with self.subTest(moment=moment):
+                result = self.invoke("escalate", "--at", moment)
+                self.assertEqual(result.returncode, 2)
+                self.assertNotEqual(result.stderr, "")
+        self.assertEqual(self.status("INC-60")["state"], "accepted")
+
+    def test_observation_before_any_created_at_rejects_all(self) -> None:
+        first = self.register("INC-70")
+        self.register("INC-71")
+        from datetime import datetime, timedelta
+
+        moment = (
+            datetime.strptime(first["created_at"], self.FMT) - timedelta(seconds=1)
+        ).strftime(self.FMT)
+        result = self.invoke("escalate", "--at", moment)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "")
+        for ticket_id in ("INC-70", "INC-71"):
+            record = self.status(ticket_id)
+            self.assertEqual(record["state"], "accepted")
+            self.assertEqual(record["escalations"], [])
+
+    def test_failed_write_rolls_back_everything(self) -> None:
+        from datetime import datetime, timedelta
+
+        tickets = [self.register(f"INC-8{i}") for i in range(3)]
+        moment = (
+            datetime.strptime(tickets[-1]["response_due_at"], self.FMT)
+            + timedelta(seconds=1)
+        ).strftime(self.FMT)
+        os.chmod(self.db_path, 0o444)
+        self.addCleanup(lambda: os.chmod(self.db_path, 0o644))
+        result = self.invoke("escalate", "--at", moment)
+        self.assertNotEqual(result.returncode, 0)
+        os.chmod(self.db_path, 0o644)
+        for i in range(3):
+            record = self.status(f"INC-8{i}")
+            self.assertEqual(record["state"], "accepted")
+            self.assertEqual(record["escalations"], [])
 
 
 if __name__ == "__main__":
