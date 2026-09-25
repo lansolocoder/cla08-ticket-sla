@@ -48,7 +48,7 @@ python3 -m sla_desk ticket create --db ledger.db \
 
 ### 响应截止（deadline）
 
-SLA 响应额度按优先级为 high/medium/low 分别 60/240/480 分钟。从 `created-at`
+SLA 响应额度按优先级为 urgent/high/medium/low 分别 30/60/240/480 分钟。从 `created-at`
 起只累计落在服务时段内的时间，跨多个天的时段逐日累加；若受理时刻在时段之外，
 则从下一个时段起点开始累计。deadline 可落在时段边界内，也可恰在时段终点。
 
@@ -70,13 +70,41 @@ python3 -m sla_desk ticket resume --db ledger.db --id T-001 --at 2026-03-02T14:0
 - 重复 pause（已暂停）/ 重复 resume（未暂停）报错退出码 2；工单不存在报错退出码 1
 - 成功时退出码 0，stdout 输出与 `ticket show` 相同形状的一行 JSON
 
+## 到期升级
+
+`ticket escalate` 接收 `--db` 与 `--at`（带时区偏移的 ISO8601 时刻），对台账中
+每个已到响应截止、且尚未升级到顶级的工单各执行一次升级：
+
+```bash
+python3 -m sla_desk ticket escalate --db ledger.db --at 2026-03-02T18:00:00+08:00
+```
+
+- 升级等级按优先级固定递进：`high`→`urgent`、`medium`→`high`、`low`→`medium`；
+  `urgent` 为顶级，不再升级
+- 到期判定一律按当前记录重算的有效截止（即 `ticket show` 的 `deadline`），与状态
+  无关：暂停中工单的冻结截止已过也算到期；`--at` 早于工单受理时刻的工单跳过不升级
+- 升级改写优先级，并以升级时刻为锚点、按新等级额度重算截止（计时口径与 deadline
+  算法一致，只累计服务时段内时间）：
+  - 运行中工单从 `--at` 起累计服务时段内时间补满新额度
+  - 暂停中工单从 `--at` 起按新额度冻结新截止，保持暂停、`paused_at`/`resumed_at`
+    不变；之后 `ticket resume` 的 `--at` 不得早于升级时刻，并按剩余额度重算
+- 同一工单可多次升级（如 low→medium 后再次到期→high），每次记一条
+- 成功时退出码 0，stdout 输出一行 JSON 数组，元素形状为
+  `{"id":…,"escalations":[…本命令产生的升级记录…]}`，按 id 字典序；无工单到期时
+  输出 `[]`。任一工单升级失败时 stdout 为空、退出码 1，全部工单（含已升级的）保持
+  执行前原样，不留半条升级记录
+
 ## 查询
 
 按 id 查询，stdout 输出一行 JSON，包含 `id`、`priority`、`window_id`、`created_at`、
-`deadline`、`state`、`paused_at`、`resumed_at`。`state` 为 `running` 或 `paused`；
-未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。`deadline` 恒为按当前记录
-重算的有效截止：running 且从未暂停时与受理时算法一致，暂停中为按暂停时刻冻结的截止，
-恢复后为补足剩余额度后的新截止。
+`deadline`、`state`、`paused_at`、`resumed_at`、`escalations`。`state` 为 `running`
+或 `paused`；未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。`deadline`
+恒为按当前记录重算的有效截止：running 且从未暂停时与受理时算法一致，暂停中为按暂停
+时刻冻结的截止，恢复后为补足剩余额度后的新截止。
+
+`escalations` 为升级记录数组，按发生时间升序；每条含 `at`（UTC ISO8601，带 `Z`、
+秒级精度、不带小数秒）、`from`、`to` 三个字段，值为升级时刻与升级前后优先级的字面
+值；从未升级为 `[]`。
 
 ```bash
 python3 -m sla_desk ticket show --db ledger.db --id T-001
