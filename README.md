@@ -31,11 +31,15 @@ python3 -m sla_desk window create --db ledger.db \
 - `--priority`：`high` | `medium` | `low`（精确小写），其他取值报错且不写库
 - `--window-id`：引用已登记的服务时段，不存在则整条创建失败
 - `--created-at`：带时区偏移的 ISO8601 时刻，如 `2026-03-02T09:15:00+08:00`
+- `--tier1`、`--tier2`、`--tier3`：由高到低三级升级目标队列，均为 1–16 位
+  小写字母数字串（不带空白），三个值必须互不相同，否则登记失败（退出码 2）、不写库。
+  工单登记后初始处于 `tier1` 队列。
 
 ```bash
 python3 -m sla_desk ticket create --db ledger.db \
     --id T-001 --priority high --window-id business-hours \
-    --created-at 2026-03-02T09:15:00+08:00
+    --created-at 2026-03-02T09:15:00+08:00 \
+    --tier1 tier1 --tier2 tier2 --tier3 tier3
 ```
 
 成功时退出码 0，stdout 输出一行工单 JSON：
@@ -70,11 +74,38 @@ python3 -m sla_desk ticket resume --db ledger.db --id T-001 --at 2026-03-02T14:0
 - 重复 pause（已暂停）/ 重复 resume（未暂停）报错退出码 2；工单不存在报错退出码 1
 - 成功时退出码 0，stdout 输出与 `ticket show` 相同形状的一行 JSON
 
+## 工单升级
+
+`ticket escalate` 接收 `--db`、`--id` 与 `--at`（带时区偏移的 ISO8601 时刻），
+把工单从当前队列转入登记时给定的下一级队列（tier1 → tier2 → tier3），并记录一条
+升级留痕。升级不改变 deadline 的计算，也不影响暂停/恢复规则。
+
+```bash
+python3 -m sla_desk ticket escalate --db ledger.db --id T-001 \
+    --at 2026-03-02T11:15:00+08:00
+```
+
+- 仅当工单状态为 `running` 且 `--at` 不早于其当前有效 deadline 时允许升级；
+  `--at` 早于受理时刻同样拒绝
+- 暂停中的工单不可升级；已处于 tier3 的工单再次升级拒绝
+- 上述业务拒绝均为退出码 2、stdout 为空、不写库，工单与已有升级记录保持不变；
+  工单不存在退出码 1
+- 同一工单可逐级多次升级。成功时退出码 0，stdout 输出一行 JSON：
+
+```json
+{"id":"T-001","level":"tier2","history":[{"from":"tier1","to":"tier2","at":"2026-03-02T03:15:00Z"}]}
+```
+
+`level` 为升级后的当前队列，`history` 按 `at` 升序列出该工单的全部升级记录，
+时刻统一为 UTC ISO8601（带 `Z`、秒级精度）。
+
 ## 查询
 
 按 id 查询，stdout 输出一行 JSON，包含 `id`、`priority`、`window_id`、`created_at`、
-`deadline`、`state`、`paused_at`、`resumed_at`。`state` 为 `running` 或 `paused`；
-未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。`deadline` 恒为按当前记录
+`deadline`、`state`、`paused_at`、`resumed_at`、`level`、`escalations`。`state` 为
+`running` 或 `paused`；未暂停或从未暂停过时 `paused_at`/`resumed_at` 为 `null`。
+`level` 为工单当前所在队列（初始为登记时的 tier1）；`escalations` 为升级记录数组，
+形状与升级命令的 `history` 相同，从未升级时为 `[]`。`deadline` 恒为按当前记录
 重算的有效截止：running 且从未暂停时与受理时算法一致，暂停中为按暂停时刻冻结的截止，
 恢复后为补足剩余额度后的新截止。
 

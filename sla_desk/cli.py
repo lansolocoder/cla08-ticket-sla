@@ -13,6 +13,7 @@ from . import __version__
 SLA_MINUTES = {"high": 60, "medium": 240, "low": 480}
 
 _HHMM = re.compile(r"^([0-2]\d):([0-5]\d)$")
+_TIER_NAME = re.compile(r"^[0-9a-z]{1,16}$")
 
 
 def _parse_hhmm(value: str) -> int:
@@ -46,6 +47,15 @@ def _parse_timestamp(value: str) -> datetime:
 
 def _format_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_tier(value: str) -> str:
+    if _TIER_NAME.match(value) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid tier {value!r}; expected 1-16 lowercase alphanumeric "
+            "characters without whitespace"
+        )
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,6 +106,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ISO8601",
         help="受理时刻（带时区偏移的 ISO8601）",
     )
+    for tier_option in ("--tier1", "--tier2", "--tier3"):
+        ticket_create.add_argument(
+            tier_option,
+            required=True,
+            type=_parse_tier,
+            metavar="QUEUE",
+            help=f"{tier_option[2:]} 升级目标队列（1-16 位小写字母数字串，三级互不相同）",
+        )
     ticket_create.set_defaults(handler=_ticket_create)
 
     ticket_pause = ticket_commands.add_parser("pause", help="暂停工单 SLA 计时")
@@ -122,6 +140,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ticket_resume.set_defaults(handler=_ticket_resume)
 
+    ticket_escalate = ticket_commands.add_parser(
+        "escalate", help="将工单升级到下一级队列"
+    )
+    ticket_escalate.add_argument("--db", required=True, help="SQLite 台账路径")
+    ticket_escalate.add_argument("--id", required=True, help="工单 id")
+    ticket_escalate.add_argument(
+        "--at",
+        required=True,
+        type=_parse_timestamp,
+        metavar="ISO8601",
+        help="升级时刻（带时区偏移的 ISO8601）",
+    )
+    ticket_escalate.set_defaults(handler=_ticket_escalate)
+
     ticket_show = ticket_commands.add_parser("show", help="按 id 查询工单")
     ticket_show.add_argument("--db", required=True, help="SQLite 台账路径")
     ticket_show.add_argument("--id", required=True, help="工单 id")
@@ -140,6 +172,10 @@ _TICKET_EXTRA_COLUMNS = (
     ("consumed_seconds", "INTEGER NOT NULL DEFAULT 0"),
     ("tz_offset_seconds", "INTEGER NOT NULL DEFAULT 0"),
     ("pause_high_water", "TEXT"),
+    ("tier1", "TEXT"),
+    ("tier2", "TEXT"),
+    ("tier3", "TEXT"),
+    ("current_level", "TEXT"),
 )
 
 
@@ -162,6 +198,13 @@ def _connect(db_path: str) -> sqlite3.Connection:
         "consumed_seconds INTEGER NOT NULL DEFAULT 0, "
         "tz_offset_seconds INTEGER NOT NULL DEFAULT 0, "
         "pause_high_water TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS escalations ("
+        "ticket_id TEXT NOT NULL REFERENCES tickets(id), "
+        "from_level TEXT NOT NULL, "
+        "to_level TEXT NOT NULL, "
+        "at TEXT NOT NULL)"
     )
     existing = {row[1] for row in conn.execute("PRAGMA table_info(tickets)")}
     for name, declaration in _TICKET_EXTRA_COLUMNS:
@@ -260,12 +303,22 @@ def _parse_utc(text: str) -> datetime:
 _TICKET_SELECT = (
     "SELECT t.id, t.priority, t.window_id, t.created_at, t.paused_at, t.resumed_at, "
     "t.consumed_seconds, t.tz_offset_seconds, t.pause_high_water, "
+    "t.tier1, t.tier2, t.tier3, t.current_level, "
     "w.start_minute, w.end_minute "
     "FROM tickets t JOIN windows w ON w.id = t.window_id"
 )
 
 
-def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
+def _escalation_history(conn: sqlite3.Connection, ticket_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT from_level, to_level, at FROM escalations "
+        "WHERE ticket_id = ? ORDER BY at ASC, rowid ASC",
+        (ticket_id,),
+    ).fetchall()
+    return [{"from": from_level, "to": to_level, "at": at} for from_level, to_level, at in rows]
+
+
+def _ticket_payload(conn: sqlite3.Connection, row: sqlite3.Row | tuple) -> dict:
     (
         _id,
         priority,
@@ -276,6 +329,10 @@ def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
         consumed_seconds,
         tz_offset_seconds,
         _pause_high_water,
+        _tier1,
+        _tier2,
+        _tier3,
+        current_level,
         start_minute,
         end_minute,
     ) = row
@@ -302,6 +359,8 @@ def _ticket_payload(row: sqlite3.Row | tuple) -> dict:
         "state": state,
         "paused_at": paused_at,
         "resumed_at": resumed_at,
+        "level": current_level,
+        "escalations": _escalation_history(conn, _id),
     }
 
 
@@ -332,6 +391,13 @@ def _window_create(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
 
 
 def _ticket_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    tiers = (args.tier1, args.tier2, args.tier3)
+    if len(set(tiers)) != 3:
+        print(
+            "sla-desk: error: --tier1/--tier2/--tier3 必须互不相同",
+            file=sys.stderr,
+        )
+        return 2
     try:
         conn = _connect(args.db)
     except sqlite3.Error as exc:
@@ -360,8 +426,9 @@ def _ticket_create(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             with conn:
                 conn.execute(
                     "INSERT INTO tickets "
-                    "(id, priority, window_id, created_at, deadline, tz_offset_seconds) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(id, priority, window_id, created_at, deadline, tz_offset_seconds, "
+                    "tier1, tier2, tier3, current_level) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         args.id,
                         args.priority,
@@ -369,6 +436,10 @@ def _ticket_create(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
                         created_at_text,
                         deadline_text,
                         tz_offset_seconds,
+                        args.tier1,
+                        args.tier2,
+                        args.tier3,
+                        args.tier1,
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -409,13 +480,14 @@ def _ticket_show(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
         return 1
     try:
         row = _fetch_ticket(conn, args.id)
+        if row is None:
+            print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
+            return 1
+        payload = _ticket_payload(conn, row)
     finally:
         conn.close()
 
-    if row is None:
-        print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
-        return 1
-    print(json.dumps(_ticket_payload(row), separators=(",", ":")))
+    print(json.dumps(payload, separators=(",", ":")))
     return 0
 
 
@@ -429,10 +501,11 @@ def _ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
         rows = conn.execute(
             _TICKET_SELECT + " ORDER BY t.created_at ASC, t.id ASC"
         ).fetchall()
+        payloads = [_ticket_payload(conn, row) for row in rows]
     finally:
         conn.close()
 
-    print(json.dumps([_ticket_payload(row) for row in rows], separators=(",", ":")))
+    print(json.dumps(payloads, separators=(",", ":")))
     return 0
 
 
@@ -448,7 +521,7 @@ def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
             return 1
 
-        payload = _ticket_payload(row)
+        payload = _ticket_payload(conn, row)
         if payload["state"] == "paused":
             print(
                 f"sla-desk: error: 工单 {args.id!r} 已处于暂停状态",
@@ -480,6 +553,10 @@ def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             consumed_seconds,
             tz_offset_seconds,
             pause_high_water,
+            _tier1,
+            _tier2,
+            _tier3,
+            _current_level,
             start_minute,
             end_minute,
         ) = row
@@ -509,7 +586,7 @@ def _ticket_pause(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 "pause_high_water = ?, deadline = ? WHERE id = ?",
                 (at_text, consumed, pause_high_water, _format_utc(frozen), args.id),
             )
-        payload = _ticket_payload(_fetch_ticket(conn, args.id))
+        payload = _ticket_payload(conn, _fetch_ticket(conn, args.id))
     except sqlite3.Error as exc:
         print(f"sla-desk: error: {exc}", file=sys.stderr)
         return 1
@@ -532,7 +609,7 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
             return 1
 
-        payload = _ticket_payload(row)
+        payload = _ticket_payload(conn, row)
         if payload["state"] != "paused":
             print(
                 f"sla-desk: error: 工单 {args.id!r} 未处于暂停状态",
@@ -559,6 +636,10 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             consumed_seconds,
             tz_offset_seconds,
             _high_water,
+            _tier1,
+            _tier2,
+            _tier3,
+            _current_level,
             start_minute,
             end_minute,
         ) = row
@@ -577,7 +658,7 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
                 "WHERE id = ?",
                 (at_text, _format_utc(deadline), args.id),
             )
-        payload = _ticket_payload(_fetch_ticket(conn, args.id))
+        payload = _ticket_payload(conn, _fetch_ticket(conn, args.id))
     except sqlite3.Error as exc:
         print(f"sla-desk: error: {exc}", file=sys.stderr)
         return 1
@@ -585,6 +666,98 @@ def _ticket_resume(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         conn.close()
 
     print(json.dumps(payload, separators=(",", ":")))
+    return 0
+
+
+def _ticket_escalate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    try:
+        conn = _connect(args.db)
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: 无法打开台账 {args.db!r}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        row = _fetch_ticket(conn, args.id)
+        if row is None:
+            print(f"sla-desk: error: 工单 {args.id!r} 不存在", file=sys.stderr)
+            return 1
+
+        payload = _ticket_payload(conn, row)
+        if payload["state"] != "running":
+            print(
+                f"sla-desk: error: 工单 {args.id!r} 处于暂停状态，不可升级",
+                file=sys.stderr,
+            )
+            return 2
+
+        at_utc = args.at.astimezone(timezone.utc)
+        if at_utc < _parse_utc(payload["created_at"]):
+            print(
+                f"sla-desk: error: --at 早于工单 {args.id!r} 的受理时刻",
+                file=sys.stderr,
+            )
+            return 2
+        if at_utc < _parse_utc(payload["deadline"]):
+            print(
+                f"sla-desk: error: --at 早于工单 {args.id!r} 的当前响应截止",
+                file=sys.stderr,
+            )
+            return 2
+
+        (
+            _id,
+            _priority,
+            _window_id,
+            _created_at,
+            _paused_at,
+            _resumed_at,
+            _consumed_seconds,
+            _tz_offset_seconds,
+            _pause_high_water,
+            tier1,
+            tier2,
+            tier3,
+            current_level,
+            _start_minute,
+            _end_minute,
+        ) = row
+        tiers = (tier1, tier2, tier3)
+        try:
+            index = tiers.index(current_level)
+        except ValueError:
+            index = -1
+        if index >= len(tiers) - 1:
+            print(
+                f"sla-desk: error: 工单 {args.id!r} 已处于最高级队列，不可再升级",
+                file=sys.stderr,
+            )
+            return 2
+
+        from_level = tiers[index]
+        to_level = tiers[index + 1]
+        at_text = _format_utc(at_utc)
+        with conn:
+            conn.execute(
+                "INSERT INTO escalations (ticket_id, from_level, to_level, at) "
+                "VALUES (?, ?, ?, ?)",
+                (args.id, from_level, to_level, at_text),
+            )
+            conn.execute(
+                "UPDATE tickets SET current_level = ? WHERE id = ?",
+                (to_level, args.id),
+            )
+        history = _escalation_history(conn, args.id)
+    except sqlite3.Error as exc:
+        print(f"sla-desk: error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    print(
+        json.dumps(
+            {"id": args.id, "level": to_level, "history": history},
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 
@@ -598,5 +771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):
-        parser.error("缺少子命令（window create / ticket create|pause|resume|show|list）")
+        parser.error(
+            "缺少子命令（window create / ticket create|pause|resume|escalate|show|list）"
+        )
     return args.handler(args, parser)
