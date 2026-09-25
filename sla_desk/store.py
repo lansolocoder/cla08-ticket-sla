@@ -13,9 +13,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .sla import parse_instant
+
 DB_FILENAME = "sla-desk.db"
 
 STATUS_OPEN = "open"
+STATUS_PAUSED = "paused"
 STATUS_MERGED = "merged"
 
 VALID_PRIORITIES = ("P1", "P2", "P3", "P4")
@@ -49,6 +52,10 @@ class MergeConflict(StoreError):
     """合并前置条件不满足（不存在/非 open/同一单/已合并）。"""
 
 
+class PauseConflict(StoreError):
+    """暂停/恢复前置条件不满足（状态不对或时刻乱序）。"""
+
+
 @dataclass(frozen=True)
 class Ticket:
     ticket_id: str
@@ -64,6 +71,10 @@ class Ticket:
     @property
     def is_open(self) -> bool:
         return self.status == STATUS_OPEN
+
+    @property
+    def is_paused(self) -> bool:
+        return self.status == STATUS_PAUSED
 
 
 class Store:
@@ -87,6 +98,17 @@ class Store:
                 merged_into  TEXT,
                 merged_at    TEXT,
                 FOREIGN KEY (merged_into) REFERENCES tickets(ticket_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pauses (
+                seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id  TEXT NOT NULL,
+                paused_at  TEXT NOT NULL,
+                resumed_at TEXT,
+                FOREIGN KEY (ticket_id) REFERENCES tickets(ticket_id)
             )
             """
         )
@@ -237,6 +259,141 @@ class Store:
         ).fetchall()
         return [_row_to_ticket(row) for row in rows]
 
+    # ------------------------------------------------------------------
+    # 暂停 / 恢复
+    # ------------------------------------------------------------------
+
+    def pause(self, ticket_id: str, instant_text: str) -> Ticket:
+        """在给定时刻暂停 open 工单，时刻文本原样保存。
+
+        非 open（含重复暂停、merged）、时刻无法解析、早于提交时刻或
+        早于上一次恢复时刻时抛错且不写入任何数据。
+        """
+        key = normalize_ticket_id(ticket_id)
+        instant = _parse_instant(instant_text)
+
+        with self._transaction() as conn:
+            ticket = _load(conn, key)
+            if not ticket.is_open:
+                raise PauseConflict(
+                    "只有 open 状态的工单可以暂停："
+                    f"{key} 当前状态为 {ticket.status}"
+                )
+            self._check_instant_order(conn, key, ticket, instant)
+            conn.execute(
+                "INSERT INTO pauses (ticket_id, paused_at) VALUES (?, ?)",
+                (key, instant_text),
+            )
+            conn.execute(
+                "UPDATE tickets SET status = ? WHERE ticket_id = ?",
+                (STATUS_PAUSED, key),
+            )
+            conn.execute("COMMIT")
+            return Ticket(
+                ticket_id=ticket.ticket_id,
+                request_no=ticket.request_no,
+                title=ticket.title,
+                email=ticket.email,
+                priority=ticket.priority,
+                submitted_at=ticket.submitted_at,
+                status=STATUS_PAUSED,
+                merged_into=ticket.merged_into,
+                merged_at=ticket.merged_at,
+            )
+
+    def resume(self, ticket_id: str, instant_text: str) -> Ticket:
+        """在给定时刻恢复暂停中的工单，时刻文本原样保存。
+
+        非 paused（含对未暂停工单恢复、merged）、时刻无法解析、早于
+        提交时刻或当前暂停起点时抛错且不修改任何数据。
+        """
+        key = normalize_ticket_id(ticket_id)
+        instant = _parse_instant(instant_text)
+
+        with self._transaction() as conn:
+            ticket = _load(conn, key)
+            if not ticket.is_paused:
+                raise PauseConflict(
+                    "只有 paused 状态的工单可以恢复："
+                    f"{key} 当前状态为 {ticket.status}"
+                )
+            self._check_instant_order(conn, key, ticket, instant)
+            conn.execute(
+                """
+                UPDATE pauses
+                   SET resumed_at = ?
+                 WHERE ticket_id = ? AND resumed_at IS NULL
+                """,
+                (instant_text, key),
+            )
+            conn.execute(
+                "UPDATE tickets SET status = ? WHERE ticket_id = ?",
+                (STATUS_OPEN, key),
+            )
+            conn.execute("COMMIT")
+            return Ticket(
+                ticket_id=ticket.ticket_id,
+                request_no=ticket.request_no,
+                title=ticket.title,
+                email=ticket.email,
+                priority=ticket.priority,
+                submitted_at=ticket.submitted_at,
+                status=STATUS_OPEN,
+                merged_into=ticket.merged_into,
+                merged_at=ticket.merged_at,
+            )
+
+    def _check_instant_order(
+        self,
+        conn: sqlite3.Connection,
+        key: str,
+        ticket: Ticket,
+        instant: datetime,
+    ) -> None:
+        """时刻不得早于提交时刻或最近一次暂停/恢复事件。"""
+        submitted = parse_instant(ticket.submitted_at)
+        if instant < submitted:
+            raise PauseConflict(
+                f"时刻早于工单提交时刻 {ticket.submitted_at}"
+            )
+        row = conn.execute(
+            """
+            SELECT paused_at, resumed_at FROM pauses
+             WHERE ticket_id = ? ORDER BY seq DESC LIMIT 1
+            """,
+            (key,),
+        ).fetchone()
+        if row is None:
+            return
+        last_text = row["resumed_at"] or row["paused_at"]
+        last_instant = parse_instant(last_text)
+        if instant < last_instant:
+            raise PauseConflict(
+                f"时刻 {instant.isoformat()} 早于上一事件时刻 {last_text}，"
+                "暂停与恢复时刻必须按顺序给出"
+            )
+
+    def get_pauses(
+        self, ticket_id: str
+    ) -> list[tuple[datetime, datetime | None]]:
+        """返回工单按顺序排列的暂停区间（止点 None 表示仍在暂停）。"""
+        rows = self._conn.execute(
+            """
+            SELECT paused_at, resumed_at FROM pauses
+             WHERE ticket_id = ? ORDER BY seq
+            """,
+            (normalize_ticket_id(ticket_id),),
+        ).fetchall()
+        intervals: list[tuple[datetime, datetime | None]] = []
+        for row in rows:
+            resumed = (
+                parse_instant(row["resumed_at"])
+                if row["resumed_at"] is not None
+                else None
+            )
+            intervals.append((parse_instant(row["paused_at"]), resumed))
+        return intervals
+
 
 # ----------------------------------------------------------------------
 # 辅助函数
@@ -276,6 +433,17 @@ def normalize_ticket_id(value: str) -> str:
             f"工单号格式非法：{value!r}，应为 T1、T2 这样的形式"
         )
     return f"T{number}"
+
+
+def _parse_instant(text: str) -> datetime:
+    """解析 pause/resume 时刻；无法解析时抛 StoreError。"""
+    try:
+        return parse_instant(text)
+    except (ValueError, TypeError):
+        raise StoreError(
+            f"时刻无法解析：{text!r}，应为 ISO 8601 形式"
+            "（如 2026-09-24T10:30:00+08:00）"
+        )
 
 
 def next_ticket_id(conn: sqlite3.Connection) -> str:

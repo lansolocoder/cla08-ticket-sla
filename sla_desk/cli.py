@@ -3,8 +3,10 @@
 import argparse
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 
 from . import __version__
+from . import sla
 from .store import DB_FILENAME, Store, StoreError, ValidationError
 
 
@@ -40,6 +42,20 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("ticket_id", metavar="被并工单", help="要被并入的工单号，如 T2")
     merge.add_argument("master_id", metavar="主工单", help="保留的主工单号，如 T1")
 
+    pause = subparsers.add_parser("pause", help="在指定时刻暂停工单计时")
+    pause.add_argument("ticket_id", metavar="T<n>", help="工单号，如 T1")
+    pause.add_argument(
+        "instant", metavar="时刻",
+        help="暂停时刻（ISO 8601，可带偏移，如 2026-09-24T10:30:00+08:00）",
+    )
+
+    resume = subparsers.add_parser("resume", help="在指定时刻恢复工单计时")
+    resume.add_argument("ticket_id", metavar="T<n>", help="工单号，如 T1")
+    resume.add_argument(
+        "instant", metavar="时刻",
+        help="恢复时刻（ISO 8601，可带偏移，如 2026-09-24T11:00:00+08:00）",
+    )
+
     subparsers.add_parser("list", help="列出所有 open 状态的工单（按工单号升序）")
     return parser
 
@@ -60,6 +76,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _cmd_show(store, args)
             if args.command == "merge":
                 return _cmd_merge(store, args)
+            if args.command == "pause":
+                return _cmd_pause(store, args)
+            if args.command == "resume":
+                return _cmd_resume(store, args)
             if args.command == "list":
                 return _cmd_list(store)
     except ValidationError as exc:
@@ -98,10 +118,40 @@ def _cmd_show(store: Store, args: argparse.Namespace) -> int:
     print(f"优先级: {ticket.priority}")
     print(f"提交时间: {ticket.submitted_at}")
     print(f"状态: {ticket.status}")
+
+    submitted = sla.parse_instant(ticket.submitted_at)
+    now = datetime.now().astimezone()
+    pauses = store.get_pauses(ticket.ticket_id)
+    due, elapsed, _freeze = sla.sla_state(
+        submitted, ticket.priority, pauses, now
+    )
+    target = sla.RESPONSE_TARGETS[ticket.priority]
+    # 暂停中剩余按暂停时刻冻结：elapsed 已在暂停起点冻结，剩余即目标之差。
+    remaining = target - elapsed
+    print(f"响应截止: {due.isoformat()}")
+    print(f"已耗时: {sla.floor_minutes(elapsed)} 分钟")
+    print(f"剩余: {sla.floor_minutes(remaining)} 分钟")
+
     if ticket.merged_into is not None:
         print(f"主工单号: {ticket.merged_into}")
         if ticket.merged_at:
             print(f"合并时间: {ticket.merged_at}")
+    return 0
+
+
+def _cmd_pause(store: Store, args: argparse.Namespace) -> int:
+    ticket = store.pause(args.ticket_id, args.instant)
+    print(f"工单号: {ticket.ticket_id}")
+    print(f"状态: {ticket.status}")
+    print(f"暂停时间: {args.instant}")
+    return 0
+
+
+def _cmd_resume(store: Store, args: argparse.Namespace) -> int:
+    ticket = store.resume(args.ticket_id, args.instant)
+    print(f"工单号: {ticket.ticket_id}")
+    print(f"状态: {ticket.status}")
+    print(f"恢复时间: {args.instant}")
     return 0
 
 

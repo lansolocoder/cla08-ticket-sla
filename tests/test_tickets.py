@@ -264,6 +264,164 @@ class TicketCliTests(unittest.TestCase):
         self.assertEqual(lines[0].split("\t")[:2], ["T1", "P3"])
         self.assertEqual(lines[1].split("\t")[:2], ["T2", "P1"])
 
+    # ------------------------------------------------------------------
+    # SLA 计时、暂停与恢复
+    # ------------------------------------------------------------------
+
+    def test_show_prints_sla_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1", priority="P1",
+                          submitted_at="2026-09-24T10:00:00+08:00")
+            show = self.invoke(cwd, "show", "T1")
+            self.assertEqual(show.returncode, 0, show.stderr)
+            self.assertIn("响应截止: 2026-09-24T10:15:00+08:00", show.stdout)
+            self.assertIn("已耗时:", show.stdout)
+            self.assertIn("剩余:", show.stdout)
+            self.assertIn(" 分钟", show.stdout)
+
+    def test_p4_deadline_is_one_business_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1", priority="P4",
+                          submitted_at="2026-09-24T14:00:00+08:00")
+            show = self.invoke(cwd, "show", "T1")
+            # 当天剩 4 小时，次日再 4 小时 -> 13:00
+            self.assertIn("响应截止: 2026-09-25T13:00:00+08:00", show.stdout)
+
+    def test_pause_and_resume_succeed_and_freeze_and_extend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1", priority="P1",
+                          submitted_at="2026-09-24T10:00:00+08:00")
+
+            paused = self.invoke(cwd, "pause", "T1", "2026-09-24T10:05:00+08:00")
+            self.assertEqual(paused.returncode, 0, paused.stderr)
+            self.assertIn("状态: paused", paused.stdout)
+            self.assertIn("暂停时间: 2026-09-24T10:05:00+08:00", paused.stdout)
+
+            # 暂停中：状态 paused，已耗 5 分钟、剩余冻结为 10 分钟
+            frozen = self.invoke(cwd, "show", "T1")
+            self.assertIn("状态: paused", frozen.stdout)
+            self.assertIn("已耗时: 5 分钟", frozen.stdout)
+            self.assertIn("剩余: 10 分钟", frozen.stdout)
+            self.assertIn("响应截止: 2026-09-24T10:15:00+08:00", frozen.stdout)
+
+            resumed = self.invoke(cwd, "resume", "T1", "2026-09-24T10:10:00+08:00")
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertIn("状态: open", resumed.stdout)
+            self.assertIn("恢复时间: 2026-09-24T10:10:00+08:00", resumed.stdout)
+
+            # 恢复后截止顺延 5 分钟：10:20
+            after = self.invoke(cwd, "show", "T1")
+            self.assertIn("状态: open", after.stdout)
+            self.assertIn("响应截止: 2026-09-24T10:20:00+08:00", after.stdout)
+
+    def test_double_pause_and_resume_without_pause_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1",
+                          submitted_at="2026-09-24T10:00:00+08:00")
+            self.assertEqual(
+                self.invoke(cwd, "pause", "T1", "2026-09-24T10:05:00+08:00").returncode,
+                0,
+            )
+            double_pause = self.invoke(
+                cwd, "pause", "T1", "2026-09-24T10:06:00+08:00"
+            )
+            self.assertEqual(double_pause.returncode, 1)
+            self.assertEqual(double_pause.stdout, "")
+            self.assertIn("paused", double_pause.stderr)
+
+            self.assertEqual(
+                self.invoke(cwd, "resume", "T1", "2026-09-24T10:10:00+08:00").returncode,
+                0,
+            )
+            resume_open = self.invoke(
+                cwd, "resume", "T1", "2026-09-24T10:11:00+08:00"
+            )
+            self.assertEqual(resume_open.returncode, 1)
+            self.assertEqual(resume_open.stdout, "")
+            self.assertIn("open", resume_open.stderr)
+
+    def test_pause_resume_merged_ticket_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1")
+            self.register(cwd, request_no="CR-2", title="b",
+                          email="a@b.com", priority="P2",
+                          submitted_at="2026-09-24T11:00:00+08:00")
+            self.invoke(cwd, "merge", "T2", "T1")
+            for cmd in ("pause", "resume"):
+                with self.subTest(cmd=cmd):
+                    result = self.invoke(
+                        cwd, cmd, "T2", "2026-09-24T11:30:00+08:00"
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("merged", result.stderr)
+
+    def test_out_of_order_and_pre_submission_instants_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1",
+                          submitted_at="2026-09-24T10:00:00+08:00")
+            self.invoke(cwd, "pause", "T1", "2026-09-24T10:10:00+08:00")
+
+            # 恢复时刻早于暂停起点
+            early_resume = self.invoke(
+                cwd, "resume", "T1", "2026-09-24T10:09:00+08:00"
+            )
+            self.assertEqual(early_resume.returncode, 1)
+            self.assertEqual(early_resume.stdout, "")
+
+            # 早于提交时刻
+            self.invoke(cwd, "resume", "T1", "2026-09-24T10:20:00+08:00")
+            before_submit = self.invoke(
+                cwd, "pause", "T1", "2026-09-24T09:00:00+08:00"
+            )
+            self.assertEqual(before_submit.returncode, 1)
+
+            # 再次暂停早于上一次恢复时刻
+            out_of_order = self.invoke(
+                cwd, "pause", "T1", "2026-09-24T10:19:00+08:00"
+            )
+            self.assertEqual(out_of_order.returncode, 1)
+            self.assertEqual(out_of_order.stdout, "")
+
+            # 全部失败后状态与事件不变：仍为 paused 时已恢复为 open，
+            # 且只有一条暂停记录（再暂停一次正常时刻后 show 状态正确）
+            ok = self.invoke(cwd, "pause", "T1", "2026-09-24T10:30:00+08:00")
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn("状态: paused", self.invoke(cwd, "show", "T1").stdout)
+
+    def test_pause_resume_bad_instant_and_ticket_fail_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self.register(cwd, request_no="CR-1",
+                          submitted_at="2026-09-24T10:00:00+08:00")
+            # 无法解析的时刻
+            bad_time = self.invoke(cwd, "pause", "T1", "not-a-time")
+            self.assertEqual(bad_time.returncode, 1)
+            self.assertEqual(bad_time.stdout, "")
+            self.assertIn("时刻", bad_time.stderr)
+            # 非法工单号
+            bad_id = self.invoke(
+                cwd, "pause", "X1", "2026-09-24T10:05:00+08:00"
+            )
+            self.assertEqual(bad_id.returncode, 1)
+            self.assertEqual(bad_id.stdout, "")
+            # 不存在工单
+            missing = self.invoke(
+                cwd, "resume", "T9", "2026-09-24T10:05:00+08:00"
+            )
+            self.assertEqual(missing.returncode, 1)
+            self.assertEqual(missing.stdout, "")
+            self.assertIn("T9", missing.stderr)
+            # 工单仍为 open，未留下暂停
+            show = self.invoke(cwd, "show", "T1")
+            self.assertIn("状态: open", show.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
